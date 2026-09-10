@@ -1,16 +1,22 @@
-from subprocess import CalledProcessError, run
+from subprocess import CalledProcessError, TimeoutExpired, run
 import os
 import platform
+import re
 import shutil
 import time
 
+# Resolve SingleFile relative to this file instead of the current working
+# directory, so the exporter behaves the same no matter where it is launched
+# from (e.g. from a Docker WORKDIR or via an absolute script path).
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
 if platform.system() == "Windows":
-    SINGLEFILE_BINARY_PATH = os.path.join("node_modules", ".bin", "single-file.cmd")
+    SINGLEFILE_BINARY_PATH = os.path.join(BASE_DIR, "node_modules", ".bin", "single-file.cmd")
 else:
-    SINGLEFILE_BINARY_PATH = os.path.join("node_modules", ".bin", "single-file")
+    SINGLEFILE_BINARY_PATH = os.path.join(BASE_DIR, "node_modules", ".bin", "single-file")
 
 # Prefer calling the Node entry directly for reliable cross-platform arg passing
-SINGLEFILE_NODE_ENTRY = os.path.join("node_modules", "single-file-cli", "single-file-node.js")
+SINGLEFILE_NODE_ENTRY = os.path.join(BASE_DIR, "node_modules", "single-file-cli", "single-file-node.js")
 
 # Default Chrome/Chromium executable path is determined heuristically per-OS.
 
@@ -53,6 +59,47 @@ CHROME_PATH = _detect_chrome_path()
 
 # Default timeout in seconds for SingleFile to complete. Can be overridden.
 SINGLEFILE_TIMEOUT = 60.0  # 1 minute
+
+# single-file-cli requires Node.js 20 or newer.
+MINIMUM_NODE_MAJOR = 20
+
+
+def _node_major_version(node_path: str):
+    """Return the major version of the given Node.js executable, or None."""
+    try:
+        proc = run([node_path, "--version"], check=True, capture_output=True, text=True, timeout=10)
+    except (OSError, CalledProcessError, TimeoutExpired):
+        return None
+    match = re.search(r"\d+", proc.stdout or "")
+    return int(match.group(0)) if match else None
+
+
+def singlefile_requirements():
+    """Return a list of problems that would prevent SingleFile from running.
+
+    An empty list means HTML snapshots are ready to use. This lets the
+    exporter fail fast with a helpful message instead of capturing a stack
+    trace on machines (and slim Docker images) without Node.js or a browser.
+    """
+    problems = []
+
+    node_path = shutil.which("node")
+    if not node_path:
+        problems.append("Node.js was not found on PATH.")
+    else:
+        major = _node_major_version(node_path)
+        if major is not None and major < MINIMUM_NODE_MAJOR:
+            problems.append(
+                f"Node.js {major} is too old; SingleFile requires Node.js {MINIMUM_NODE_MAJOR}+"
+            )
+
+    if not os.path.exists(SINGLEFILE_NODE_ENTRY) and not os.path.exists(SINGLEFILE_BINARY_PATH):
+        problems.append("SingleFile is not installed; run `npm install` (or use the :singlefile image).")
+
+    if not CHROME_PATH:
+        problems.append("Chrome/Chromium was not found; install a browser or set CHROME_PATH.")
+
+    return problems
 
 
 def override_chrome_path(path: str):

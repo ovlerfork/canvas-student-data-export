@@ -12,7 +12,7 @@ import sys
 from bs4 import BeautifulSoup
 from canvasapi import Canvas
 from canvasapi.exceptions import ResourceDoesNotExist, Unauthorized, Forbidden, InvalidAccessToken, CanvasException
-from singlefile import download_page, override_chrome_path, override_singlefile_timeout
+from singlefile import download_page, override_chrome_path, override_singlefile_timeout, singlefile_requirements
 import dateutil.parser
 import jsonpickle
 import requests
@@ -128,6 +128,27 @@ def _load_credentials(path: str) -> dict:
             return yaml.full_load(f) or {}
     except FileNotFoundError:
         return {}
+
+
+# Optional environment variables for environments where mounting a YAML file is
+# inconvenient (e.g. Docker/CI). Values from the environment override the file.
+ENV_CREDENTIAL_KEYS = {
+    "API_URL": "CANVAS_API_URL",
+    "API_KEY": "CANVAS_API_KEY",
+    "USER_ID": "CANVAS_USER_ID",
+    "COOKIES_PATH": "CANVAS_COOKIES_PATH",
+    "CHROME_PATH": "CANVAS_CHROME_PATH",
+    "SINGLEFILE_TIMEOUT": "CANVAS_SINGLEFILE_TIMEOUT",
+}
+
+
+def _apply_env_overrides(creds: dict) -> dict:
+    """Overlay credentials loaded from YAML with CANVAS_* environment variables."""
+    for key, env_name in ENV_CREDENTIAL_KEYS.items():
+        value = os.environ.get(env_name)
+        if value:
+            creds[key] = value.strip()
+    return creds
 
 # Placeholder globals – will be overwritten in __main__ once we have parsed CLI args.
 API_URL = ""
@@ -1213,27 +1234,45 @@ if __name__ == "__main__":
     print("Welcome to the Canvas Student Data Export Tool\n")
 
     parser = argparse.ArgumentParser(description="Export nearly all of a student's Canvas LMS data.")
-    parser.add_argument("-c", "--config", default="credentials.yaml", help="Path to YAML credentials file (default: credentials.yaml)")
+    parser.add_argument("-c", "--config", default=os.environ.get("CANVAS_CONFIG", "credentials.yaml"), help="Path to YAML credentials file (default: credentials.yaml or $CANVAS_CONFIG)")
     parser.add_argument("-o", "--output", default="./output", help="Directory to store exported data (default: ./output)")
-    parser.add_argument("--singlefile", action="store_true", help="Enable HTML snapshot capture with SingleFile.")
+    parser.add_argument("--singlefile", action="store_true", help="Enable HTML snapshot capture with SingleFile (requires Node.js and Chrome/Chromium).")
     parser.add_argument("-v", "--verbose", action="store_true", help="Enable verbose output for debugging.")
     parser.add_argument("--version", action="version", version="Canvas Student Data Export Tool 1.0")
 
     args = parser.parse_args()
 
-    # Load credentials from YAML
-    creds = _load_credentials(args.config)
+    # Load credentials from YAML (if present) and let CANVAS_* env vars override.
+    creds = _apply_env_overrides(_load_credentials(args.config))
     
     # Validate credentials
     required = ["API_URL", "API_KEY", "USER_ID"]
     missing = [k for k in required if not creds.get(k)]
 
+    # Apply a configured browser path before checking SingleFile availability.
+    chrome_path_override = creds.get("CHROME_PATH")
+    if chrome_path_override:
+        override_chrome_path(chrome_path_override)
+
     # COOKIES_PATH is required if singlefile is active, but it can be missing.
     if args.singlefile:
+        # Fail fast when HTML snapshots cannot work at all (e.g. the slim
+        # Docker image, which intentionally ships without Node.js/Chromium).
+        problems = singlefile_requirements()
+        if problems:
+            print("Error: --singlefile is enabled, but HTML snapshots cannot run:")
+            for problem in problems:
+                print(f"  - {problem}")
+            print("Install the missing requirements (see README) or run without --singlefile.")
+            sys.exit(1)
+
         print("Note: --singlefile is enabled. Please ensure your browser cookies")
         print("      are fresh by logging into Canvas and then re-exporting")
         print("      them using the chrome extension right before running this script.\n")
-        input("Press Enter to continue...")
+        if sys.stdin.isatty():
+            input("Press Enter to continue...")
+        else:
+            print("Non-interactive environment detected, continuing...\n")
         if "COOKIES_PATH" not in creds or not creds["COOKIES_PATH"]:
             missing.append("COOKIES_PATH")
 
@@ -1249,14 +1288,14 @@ if __name__ == "__main__":
     # Populate globals expected throughout the script
     API_URL = creds["API_URL"].strip().rstrip('/')
     API_KEY = creds["API_KEY"].strip()  # Remove leading/trailing whitespace which is a common issue
-    USER_ID = creds["USER_ID"]
+    try:
+        USER_ID = int(creds["USER_ID"])
+    except (TypeError, ValueError):
+        print(f"Error: USER_ID must be an integer (got {creds['USER_ID']!r}).")
+        sys.exit(1)
     # Use .get() to safely access optional/conditionally required keys
     COOKIES_PATH = creds.get("COOKIES_PATH", "")
     COURSES_TO_SKIP = creds.get("COURSES_TO_SKIP", [])
-
-    chrome_path_override = creds.get("CHROME_PATH")
-    if chrome_path_override:
-        override_chrome_path(chrome_path_override)
 
     # Optional: Override SingleFile capture timeout (in seconds)
     singlefile_timeout_override = creds.get("SINGLEFILE_TIMEOUT")

@@ -59,7 +59,7 @@ Example output structure:
 
 ## Dependencies
 - Python 3.8 or newer
-- Node.js 16 or newer (only needed for HTML snapshots)
+- Node.js 20 or newer (only needed for HTML snapshots)
 
 1.  **Install Python dependencies:**
     ```bash
@@ -67,14 +67,72 @@ Example output structure:
     ```
 
 2.  **(Optional) Install SingleFile for HTML snapshots:**
-    This step requires Node.js.
+    This step requires Node.js 20 or newer.
     ```bash
     npm install
     ```
 
+## Docker
+
+Pre-built images are published to the GitHub Container Registry, so you do not need Python, Node.js, or a browser on your machine.
+
+| Image | Contents | Use case |
+| ----- | -------- | -------- |
+| `ghcr.io/ovlerfork/canvas-student-data-export:latest` | Python only, no browser | JSON + course file exports (~200 MB) |
+| `ghcr.io/ovlerfork/canvas-student-data-export:singlefile` | Python + Node.js + Chromium | Adds `--singlefile` HTML snapshots |
+
+The default image deliberately ships without a browser, so a full data export does not require any heavy runtime.
+
+```bash
+# JSON data, files and attachments (no browser needed)
+docker run --rm \
+  -v "$PWD/credentials.yaml:/config/credentials.yaml:ro" \
+  -v "$PWD/output:/data" \
+  ghcr.io/ovlerfork/canvas-student-data-export:latest
+
+# The same, plus HTML snapshots (larger image, includes Chromium)
+docker run --rm \
+  -v "$PWD/credentials.yaml:/config/credentials.yaml:ro" \
+  -v "$PWD/cookies.txt:/config/cookies.txt:ro" \
+  -v "$PWD/output:/data" \
+  ghcr.io/ovlerfork/canvas-student-data-export:singlefile --singlefile
+```
+
+Inside the container the exporter defaults to `-c /config/credentials.yaml -o /data`, so mount your files at those paths. Any `COOKIES_PATH` in `credentials.yaml` must also point to a path inside the container (e.g. `/config/cookies.txt`).
+
+Instead of mounting a credentials file, every value can be passed as an environment variable:
+
+```bash
+docker run --rm \
+  -e CANVAS_API_URL=https://example.instructure.com \
+  -e CANVAS_API_KEY=<your token> \
+  -e CANVAS_USER_ID=123456 \
+  -v "$PWD/output:/data" \
+  ghcr.io/ovlerfork/canvas-student-data-export:latest
+```
+
+| Variable | Equivalent YAML key |
+| -------- | ------------------- |
+| `CANVAS_CONFIG` | Path passed to `-c` (default `/config/credentials.yaml` in the container) |
+| `CANVAS_API_URL` | `API_URL` |
+| `CANVAS_API_KEY` | `API_KEY` |
+| `CANVAS_USER_ID` | `USER_ID` |
+| `CANVAS_COOKIES_PATH` | `COOKIES_PATH` |
+| `CANVAS_CHROME_PATH` | `CHROME_PATH` |
+| `CANVAS_SINGLEFILE_TIMEOUT` | `SINGLEFILE_TIMEOUT` |
+
+Environment variables override values from the YAML file. The image runs as uid 1000; if the mounted output directory is owned by another user, add `--user "$(id -u):$(id -g)"`.
+
+To build the images locally instead:
+
+```bash
+docker build -t canvas-student-data-export .
+docker build --target singlefile -t canvas-student-data-export:singlefile .
+```
+
 ## Configuration
 
-To use the tool, you must create a `credentials.yaml` file in the project root. You can also specify a different path using the `-c` or `--config` command-line option.
+To use the tool, you must create a `credentials.yaml` file in the project root (or provide the values through `CANVAS_*` environment variables, see [Docker](#docker)). You can also specify a different path using the `-c` or `--config` command-line option.
 
 Create the `credentials.yaml` file with the following content:
 
