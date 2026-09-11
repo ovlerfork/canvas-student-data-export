@@ -938,6 +938,18 @@ def findCourseDiscussions(course):
     return discussion_views
 
 
+def _course_term_name(course):
+    """Return the term name for a course.
+
+    canvasapi stores the term returned by the API as a plain dict, but a
+    CanvasObject-like attribute is handled too.
+    """
+    term = getattr(course, "term", None)
+    if isinstance(term, dict):
+        return str(term.get("name") or "")
+    return str(getattr(term, "name", "") or "") if term else ""
+
+
 def getCourseView(course):
     course_view = courseView()
 
@@ -945,7 +957,7 @@ def getCourseView(course):
     course_view.course_id = course.id if hasattr(course, "id") else 0
 
     # Course term
-    course_view.term = makeValidFilename(course.term.name if hasattr(course, "term") and hasattr(course.term, "name") else "")
+    course_view.term = makeValidFilename(_course_term_name(course))
 
     # Course code
     course_view.course_code = makeValidFilename(course.course_code if hasattr(course, "course_code") else "")
@@ -1082,8 +1094,8 @@ if __name__ == "__main__":
 
     print("Getting list of all courses\n")
     courses_list = [
-        canvas.get_courses(enrollment_state = "active", include="term"),
-        canvas.get_courses(enrollment_state = "completed", include="term")
+        canvas.get_courses(enrollment_state = "active", include=["term"]),
+        canvas.get_courses(enrollment_state = "completed", include=["term"])
     ]
 
     skip = set(COURSES_TO_SKIP)
