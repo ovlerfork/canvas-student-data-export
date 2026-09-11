@@ -29,7 +29,7 @@ class CanvasErrorHandler:
         
         elif isinstance(e, Unauthorized):
             # Check if this is a known student limitation
-            if "submissions" in operation_description.lower():
+            if "class submission" in operation_description.lower():
                 return "student_limitation", f"Not authorized to download every student's assignment submission. This is normal for student accounts."
             elif "file" in operation_description.lower():
                 return "student_limitation", f"Not authorized to download some course files. This is normal for student accounts."
@@ -421,8 +421,22 @@ def downloadCourseFiles(course, course_view):
         files = course.get_files()
         files_list = list(files)  # Convert to list for consistency and count
 
+        # Files usually share a handful of folders; cache the lookups.
+        folder_cache = {}
+
         for file in files_list:
-            file_folder=course.get_folder(file.folder_id)
+            file_folder = folder_cache.get(file.folder_id)
+            if file_folder is None:
+                try:
+                    file_folder = course.get_folder(file.folder_id)
+                except Exception as e:
+                    error_type, message = CanvasErrorHandler.handle_canvas_exception(
+                        e, f"folder lookup for {file.display_name}"
+                    )
+                    CanvasErrorHandler.log_error(error_type, message, verbose=args.verbose)
+                    extraction_stats.error_count += 1
+                    continue
+                folder_cache[file.folder_id] = file_folder
             
             folder_dl_dir=os.path.join(dl_dir, makeValidFolderPath(file_folder.full_name))
             
@@ -494,16 +508,43 @@ def download_submission_attachments(course, course_view):
                     print(f"      ✓ Already exists: {attachment.filename}")
 
 
-def getCoursePageUrls(course):
-    page_urls = []
+def _page_view_from(page):
+    """Build a pageView from a canvasapi Page object."""
+    page_view = pageView()
+
+    # ID
+    page_view.id = page.id if hasattr(page, "id") else 0
+
+    # Title
+    page_view.title = str(page.title) if hasattr(page, "title") else ""
+    # Body
+    page_view.body = str(page.body) if hasattr(page, "body") else ""
+    # URL
+    page_view.url = str(page.html_url) if hasattr(page, "html_url") else ""
+    # Date created
+    try:
+        page_view.created_date = dateutil.parser.parse(page.created_at).strftime(DATE_TEMPLATE) if \
+            hasattr(page, "created_at") else ""
+    except (ValueError, TypeError):
+        page_view.created_date = ""
+
+    # Date last updated
+    try:
+        page_view.last_updated_date = dateutil.parser.parse(page.updated_at).strftime(DATE_TEMPLATE) if \
+            hasattr(page, "updated_at") else ""
+    except (ValueError, TypeError):
+        page_view.last_updated_date = ""
+
+    return page_view
+
+
+def findCoursePages(course):
+    page_views = []
 
     try:
-        # Get all pages
-        pages = course.get_pages()
-
-        for page in pages:
-            if hasattr(page, "url"):
-                page_urls.append(str(page.url))
+        # The list endpoint is paginated and can return page bodies in one
+        # request; ask for them to avoid a detail request per page.
+        pages = course.get_pages(include=["body"])
     except Exception as e:
         error_msg = str(e)
         if "Not Found" not in error_msg:
@@ -515,53 +556,25 @@ def getCoursePageUrls(course):
                 extraction_stats.error_count += 1
             else:
                 extraction_stats.student_limitation_warnings += 1
+        return page_views
 
-    return page_urls
+    for listed_page in pages:
+        # One failing page must not stop the remaining pages from exporting.
+        try:
+            page = listed_page
+            # Some page types (e.g. block-editor pages) only expose their body
+            # through the detail endpoint, so fall back to a detail request.
+            if not getattr(listed_page, "body", None) and hasattr(listed_page, "url"):
+                page = course.get_page(listed_page.url)
 
-
-def findCoursePages(course):
-    page_views = []
-
-    try:
-        # Get all page URLs
-        page_urls = getCoursePageUrls(course)
-
-        for url in page_urls:
-            page = course.get_page(url)
-
-            page_view = pageView()
-
-            # ID
-            page_view.id = page.id if hasattr(page, "id") else 0
-
-            # Title
-            page_view.title = str(page.title) if hasattr(page, "title") else ""
-            # Body
-            page_view.body = str(page.body) if hasattr(page, "body") else ""
-            # URL
-            page_view.url = str(page.html_url) if hasattr(page, "html_url") else ""
-            # Date created
-            try:
-                page_view.created_date = dateutil.parser.parse(page.created_at).strftime(DATE_TEMPLATE) if \
-                    hasattr(page, "created_at") else ""
-            except (ValueError, TypeError):
-                page_view.created_date = ""
-                
-            # Date last updated
-            try:
-                page_view.last_updated_date = dateutil.parser.parse(page.updated_at).strftime(DATE_TEMPLATE) if \
-                    hasattr(page, "updated_at") else ""
-            except (ValueError, TypeError):
-                page_view.last_updated_date = ""
-
-            page_views.append(page_view)
+            page_views.append(_page_view_from(page))
             extraction_stats.pages_found += 1
-    except Exception as e:
-        error_type, message = CanvasErrorHandler.handle_canvas_exception(
-            e, "page download"
-        )
-        CanvasErrorHandler.log_error(error_type, message, verbose=args.verbose)
-        extraction_stats.error_count += 1
+        except Exception as e:
+            error_type, message = CanvasErrorHandler.handle_canvas_exception(
+                e, "page download"
+            )
+            CanvasErrorHandler.log_error(error_type, message, verbose=args.verbose)
+            extraction_stats.error_count += 1
 
     return page_views
 
@@ -572,6 +585,24 @@ def findCourseAssignments(course):
     # Get all assignments
     assignments = course.get_assignments()
     assignments_list = list(assignments)  # Convert to list for consistency
+
+    # Fetch the user's own submissions for the whole course in one request.
+    # Canvas only allows students to list their own submissions, so this
+    # replaces one fallback request per assignment. If the endpoint is not
+    # available the per-assignment fallback below is used instead.
+    own_submissions = None
+    if assignments_list:
+        try:
+            own_submissions = {
+                submission.assignment_id: submission
+                for submission in course.get_multiple_submissions(
+                    include=["submission_history", "submission_comments"]
+                )
+            }
+        except Exception:
+            own_submissions = None
+
+    class_submissions_forbidden = False
     
     try:
         for assignment in assignments_list:
@@ -613,24 +644,61 @@ def findCourseAssignments(course):
             assignment_view.updated_url = str(assignment.submissions_download_url).split("submissions?")[0] if \
                 hasattr(assignment, "submissions_download_url") else ""
 
-            try:
-                try: # Download all submissions for entire class
-                    submissions = assignment.get_submissions(include=["submission_history", "submission_comments"])
-                    submissions[0] # Trigger Unauthorized if not allowed
-                except (Unauthorized, Forbidden) as e:
-                    error_type, message = CanvasErrorHandler.handle_canvas_exception(
-                        e, "class submission download"
-                    )
-                    if error_type == "student_limitation":
-                        extraction_stats.student_limitation_warnings += 1
-                        if extraction_stats.student_limitation_warnings == 1:
-                            print(f"    Note: Not authorized to download every student's assignment submission. Downloading submission for user {USER_ID} only.")
-                    else:
+            submissions = None
+            try: # Download all submissions for entire class
+                if not class_submissions_forbidden:
+                    class_submissions = assignment.get_submissions(include=["submission_history", "submission_comments"])
+                    class_submissions[0] # Trigger Unauthorized if not allowed
+                    submissions = class_submissions
+            except (Unauthorized, Forbidden) as e:
+                # Canvas only allows students to list their own submissions;
+                # remember this and do not probe again for this course.
+                class_submissions_forbidden = True
+                error_type, message = CanvasErrorHandler.handle_canvas_exception(
+                    e, "class submission download"
+                )
+                if error_type == "student_limitation":
+                    extraction_stats.student_limitation_warnings += 1
+                    if extraction_stats.student_limitation_warnings == 1:
+                        print(f"    Note: Not authorized to download every student's assignment submission. Downloading submission for user {USER_ID} only.")
+                else:
+                    CanvasErrorHandler.log_error(error_type, message, verbose=args.verbose)
+                    extraction_stats.error_count += 1
+            except Exception as e:
+                # A missing or failing class listing must not stop the export;
+                # fall back to this user's own submission below.
+                error_type, message = CanvasErrorHandler.handle_canvas_exception(
+                    e, "submission retrieval"
+                )
+                CanvasErrorHandler.log_error(error_type, message, verbose=args.verbose)
+                extraction_stats.error_count += 1
+
+            if submissions is None:
+                # Use the bulk-fetched submission when it contains this
+                # assignment, otherwise ask for it individually.
+                own_submission = own_submissions.get(assignment.id) if own_submissions is not None else None
+                if own_submission is not None:
+                    submissions = [own_submission]
+                else:
+                    # Download submission for this user only
+                    try:
+                        submissions = [assignment.get_submission(USER_ID, include=["submission_history", "submission_comments"])]
+                    except (ResourceDoesNotExist, NameError, IndexError) as e:
+                        error_type, message = CanvasErrorHandler.handle_canvas_exception(
+                            e, "submission retrieval"
+                        )
                         CanvasErrorHandler.log_error(error_type, message, verbose=args.verbose)
                         extraction_stats.error_count += 1
-                    
-                    # Download submission for this user only
-                    submissions = [assignment.get_submission(USER_ID, include=["submission_history", "submission_comments"])]
+                        submissions = []
+                    except Exception as e:
+                        error_type, message = CanvasErrorHandler.handle_canvas_exception(
+                            e, "submission retrieval"
+                        )
+                        CanvasErrorHandler.log_error(error_type, message, verbose=args.verbose)
+                        extraction_stats.error_count += 1
+                        submissions = []
+
+            try:
                 submissions[0] #throw error if no submissions found at all but without error
             except (ResourceDoesNotExist, NameError, IndexError) as e:
                 error_type, message = CanvasErrorHandler.handle_canvas_exception(
