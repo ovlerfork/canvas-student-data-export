@@ -10,7 +10,7 @@ The tool exports the following data:
 - Course Pages
 - Course Files
 - Course Modules
-- (Optional) HTML snapshots of:
+- (Optional) HTML pages generated from the Canvas API:
     - Course Home Page
     - Grades Page
     - Assignments
@@ -31,16 +31,18 @@ Example output structure:
       - Sample Assignment/
         - assignment.html
         - submission.html
+        - attempts/
+          - attempt_1.html
       - assignment_list.html
     - course files/
       - file_1.docx
       - file_2.png
     - discussions/
-      - Sample Discussion
+      - Sample Discussion/
         - discussion_1.html
       - discussion_list.html
     - modules/
-      - Sample Module
+      - Sample Module/
         - Sample Assignment.html
         - Sample Discussion.html
         - Sample Page.html
@@ -53,52 +55,31 @@ Example output structure:
     - ...
 - Spring 2024
   - ...
+- course_list.html
 - all_output.json
 
 # Getting Started
 
 ## Dependencies
 - Python 3.8 or newer
-- Node.js 20 or newer (only needed for HTML snapshots)
 
-1.  **Install Python dependencies:**
-    ```bash
-    pip install -r requirements.txt
-    ```
-
-2.  **(Optional) Install SingleFile for HTML snapshots:**
-    This step requires Node.js 20 or newer.
-    ```bash
-    npm install
-    ```
+Install the Python dependencies:
+```bash
+pip install -r requirements.txt
+```
 
 ## Docker
 
-Pre-built images are published to the GitHub Container Registry, so you do not need Python, Node.js, or a browser on your machine.
-
-| Image | Contents | Use case |
-| ----- | -------- | -------- |
-| `ghcr.io/ovlerfork/canvas-student-data-export:latest` | Python only, no browser | JSON + course file exports (~200 MB) |
-| `ghcr.io/ovlerfork/canvas-student-data-export:singlefile` | Python + Node.js + Chromium | Adds `--singlefile` HTML snapshots |
-
-The default image deliberately ships without a browser, so a full data export does not require any heavy runtime.
+Pre-built images are published to the GitHub Container Registry, so you do not need Python or anything else installed locally.
 
 ```bash
-# JSON data, files and attachments (no browser needed)
 docker run --rm \
   -v "$PWD/credentials.yaml:/config/credentials.yaml:ro" \
   -v "$PWD/output:/data" \
   ghcr.io/ovlerfork/canvas-student-data-export:latest
-
-# The same, plus HTML snapshots (larger image, includes Chromium)
-docker run --rm \
-  -v "$PWD/credentials.yaml:/config/credentials.yaml:ro" \
-  -v "$PWD/cookies.txt:/config/cookies.txt:ro" \
-  -v "$PWD/output:/data" \
-  ghcr.io/ovlerfork/canvas-student-data-export:singlefile --singlefile
 ```
 
-Inside the container the exporter defaults to `-c /config/credentials.yaml -o /data`, so mount your files at those paths. Any `COOKIES_PATH` in `credentials.yaml` must also point to a path inside the container (e.g. `/config/cookies.txt`).
+Inside the container the exporter defaults to `-c /config/credentials.yaml -o /data` and generates HTML pages from the Canvas API (no browser involved). Set `CANVAS_HTML=0` to skip the HTML pages.
 
 Instead of mounting a credentials file, every value can be passed as an environment variable:
 
@@ -117,17 +98,14 @@ docker run --rm \
 | `CANVAS_API_URL` | `API_URL` |
 | `CANVAS_API_KEY` | `API_KEY` |
 | `CANVAS_USER_ID` | `USER_ID` |
-| `CANVAS_COOKIES_PATH` | `COOKIES_PATH` |
-| `CANVAS_CHROME_PATH` | `CHROME_PATH` |
-| `CANVAS_SINGLEFILE_TIMEOUT` | `SINGLEFILE_TIMEOUT` |
+| `CANVAS_HTML` | Generates HTML pages when set to `1`/`true` (default `1` in the container) |
 
 Environment variables override values from the YAML file. The image runs as uid 1000; if the mounted output directory is owned by another user, add `--user "$(id -u):$(id -g)"`.
 
-To build the images locally instead:
+To build the image locally instead:
 
 ```bash
 docker build -t canvas-student-data-export .
-docker build --target singlefile -t canvas-student-data-export:singlefile .
 ```
 
 ## Configuration
@@ -143,14 +121,6 @@ API_URL: https://example.instructure.com
 API_KEY: <Your Canvas API token>
 # Your Canvas User ID
 USER_ID: 123456
-# Path to your browser cookies file (Netscape format).
-# This is only required when using the --singlefile flag.
-COOKIES_PATH: ./cookies.txt
-# (Optional) Path to your Chrome/Chromium executable if SingleFile cannot find it.
-# CHROME_PATH: C:\Program Files\Google\Chrome\Application\chrome.exe
-# (Optional) Timeout in seconds for SingleFile to capture a page. Default: 60
-# Increase this if you see "Capture timeout" errors during HTML snapshots.
-# SINGLEFILE_TIMEOUT: 180
 # (Optional) A list of course IDs to skip when exporting data.
 # COURSES_TO_SKIP:
 #   - 12345
@@ -162,9 +132,6 @@ COOKIES_PATH: ./cookies.txt
 -   **`API_URL`**: Your institution's Canvas URL.
 -   **`API_KEY`**: In Canvas, go to `Account` > `Settings`, scroll down to `Approved Integrations`, and click `+ New Access Token`.
 -   **`USER_ID`**: After logging into Canvas, visit `https://<your-canvas-url>/api/v1/users/self`. Your browser will show a JSON response; find the `id` field.
--   **`COOKIES_PATH`**: Required **only if** you use the `--singlefile` flag. Browser cookies are needed to download complete HTML pages as if you were logged in. The script will now detect if your cookies are expired or invalid and will stop downloading HTML pages to prevent errors. For best results, log into Canvas and then export your cookies right before running the script. Use a browser extension like "Get cookies.txt Clean" for Chrome to export them in Netscape format.
--   **`CHROME_PATH`** (Optional): The script attempts to auto-detect Chrome/Chromium on Windows, macOS, and Linux. If it fails, you can specify the path here.
--   **`SINGLEFILE_TIMEOUT`** (Optional): Maximum time in seconds to wait for SingleFile to capture a single HTML page. Default is `60` seconds. If you have a slow connection or a busy computer and see "Capture timeout" errors, increase this value.
 -   **`COURSES_TO_SKIP`** (Optional): A list of course IDs to exclude from the export. To find a course ID, go to the course's homepage and look at the URL for the number that follows `/courses/`.
 
 ## Running the Exporter
@@ -177,13 +144,13 @@ python export.py [options]
 
 **Options:**
 
-| Flag                    | Description                                   | Default            |
-| ----------------------- | --------------------------------------------- | ------------------ |
-| `-c`, `--config <path>` | Path to your YAML credentials file.           | `credentials.yaml` |
-| `-o`, `--output <path>` | Directory to store exported data.             | `./output`         |
-| `--singlefile`          | Enable HTML snapshot capture with SingleFile. | Disabled           |
-| `-v`, `--verbose`       | Enable verbose output for debugging.          | Disabled           |
-| `--version`             | Show the version of the tool and exit.        | N/A                |
+| Flag                    | Description                                        | Default                        |
+| ----------------------- | -------------------------------------------------- | ------------------------------ |
+| `-c`, `--config <path>` | Path to your YAML credentials file.                | `credentials.yaml`             |
+| `-o`, `--output <path>` | Directory to store exported data.                  | `./output`                     |
+| `--html`                | Generate HTML pages from the Canvas API.           | Enabled with `CANVAS_HTML=1`   |
+| `-v`, `--verbose`       | Enable verbose output for debugging.               | Disabled                       |
+| `--version`             | Show the version of the tool and exit.             | N/A                            |
 
 **Example:**
 
@@ -191,8 +158,8 @@ python export.py [options]
 # Run with default settings (uses ./credentials.yaml, outputs to ./output)
 python export.py
 
-# Run with a custom output directory and enable HTML snapshots
-python export.py -o /path/to/my-canvas-backup --singlefile
+# Run with a custom output directory and generate HTML pages
+python export.py -o /path/to/my-canvas-backup --html
 ```
 
 After the export is complete, the tool will display a detailed summary of all the data that was successfully extracted, including counts of assignments, files, and pages, as well as any warnings or errors encountered.

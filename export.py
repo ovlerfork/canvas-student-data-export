@@ -1,22 +1,20 @@
 # built in
 import json
 import os
-import itertools
-import re
-import string
-import unicodedata
 import argparse
 import sys
 
 # external
-from bs4 import BeautifulSoup
 from canvasapi import Canvas
 from canvasapi.exceptions import ResourceDoesNotExist, Unauthorized, Forbidden, InvalidAccessToken, CanvasException
-from singlefile import download_page, override_chrome_path, override_singlefile_timeout, singlefile_requirements
 import dateutil.parser
 import jsonpickle
 import requests
 import yaml
+
+# local
+from html_export import export_course_html, export_course_list_html
+from naming import MAX_FOLDER_NAME_SIZE, makeValidFilename, makeValidFolderPath, shortenFileName
 
 # Canvas API Error Handling Utility
 class CanvasErrorHandler:
@@ -83,12 +81,12 @@ class ExtractionStats:
         self.module_items_found = 0
         self.files_downloaded = 0
         self.attachments_downloaded = 0
-        self.html_pages_downloaded = 0
+        self.html_pages_generated = 0
         self.json_files_created = 0
         self.student_limitation_warnings = 0
         self.error_count = 0
         
-    def summary(self, dl_location, singlefile_enabled=False):
+    def summary(self, dl_location, html_enabled=False):
         summary_text = f"""
 Data Extraction Summary:
   • {self.assignments_found} assignments found
@@ -103,8 +101,8 @@ Files Downloaded:
   • {self.files_downloaded} course files downloaded
   • {self.attachments_downloaded} assignment attachments downloaded"""
 
-        if singlefile_enabled:
-            summary_text += f"\n  • {self.html_pages_downloaded} HTML pages captured"
+        if html_enabled:
+            summary_text += f"\n  • {self.html_pages_generated} HTML pages generated"
 
         summary_text += f"""
 
@@ -122,7 +120,7 @@ Errors Encountered: {self.error_count}
 extraction_stats = ExtractionStats()
 
 def _load_credentials(path: str) -> dict:
-    """Return a dict with API_URL, API_KEY, USER_ID, COOKIES_PATH or empty dict if file missing."""
+    """Return a dict with API_URL, API_KEY, USER_ID or empty dict if file missing."""
     try:
         with open(path, "r", encoding="utf-8") as f:
             return yaml.full_load(f) or {}
@@ -136,9 +134,6 @@ ENV_CREDENTIAL_KEYS = {
     "API_URL": "CANVAS_API_URL",
     "API_KEY": "CANVAS_API_KEY",
     "USER_ID": "CANVAS_USER_ID",
-    "COOKIES_PATH": "CANVAS_COOKIES_PATH",
-    "CHROME_PATH": "CANVAS_CHROME_PATH",
-    "SINGLEFILE_TIMEOUT": "CANVAS_SINGLEFILE_TIMEOUT",
 }
 
 
@@ -154,7 +149,6 @@ def _apply_env_overrides(creds: dict) -> dict:
 API_URL = ""
 API_KEY = ""
 USER_ID = 0
-COOKIES_PATH = ""
 
 # Directory in which to download course information to (will be created if not
 # present)
@@ -164,13 +158,8 @@ COURSES_TO_SKIP = []
 
 DATE_TEMPLATE = "%B %d, %Y %I:%M %p"
 
-# Max PATH length is 260 characters on Windows. 70 is just an estimate for a reasonable max folder name to prevent the chance of reaching the limit
-# Applies to modules, assignments, announcements, and discussions
-# If a folder exceeds this limit, a "-" will be added to the end to indicate it was shortened ("..." not valid)
-MAX_FOLDER_NAME_SIZE = 70
-
-# Global flag to stop HTML downloads if cookies are invalid
-stop_html_downloads = False
+# Max PATH length is 260 characters on Windows. See naming.py for the shared
+# filename helpers used by the JSON and HTML exporters.
 
 
 class moduleItemView():
@@ -178,9 +167,11 @@ class moduleItemView():
     
     title = ""
     content_type = ""
+    content_id = 0
     
     url = ""
     external_url = ""
+    local_path = ""
 
 
 class moduleView():
@@ -200,6 +191,7 @@ class pageView():
     body = ""
     created_date = ""
     last_updated_date = ""
+    url = ""
 
 
 class topicReplyView():
@@ -245,6 +237,9 @@ class submissionView():
     grade = ""
     raw_score = ""
     submission_comments = ""
+    submission_comments_raw = None
+    submission_history = None
+    body = ""
     total_possible_points = ""
     attempt = 0
     user_id = "no-id"
@@ -260,6 +255,7 @@ class attachmentView():
 
     filename = ""
     url = ""
+    local_path = ""
 
 class assignmentView():
     id = 0
@@ -288,71 +284,13 @@ class courseView():
     announcements = []
     discussions = []
     modules = []
+    homepage_html = ""
 
     def __init__(self):
         self.assignments = []
         self.announcements = []
         self.discussions = []
         self.modules = []
-
-def makeValidFilename(input_str):
-    if(not input_str):
-        return input_str
-
-    # Normalize Unicode and whitespace
-    input_str = unicodedata.normalize('NFKC', input_str)
-    input_str = input_str.replace("\u00A0", " ") # NBSP to space
-    input_str = re.sub(r"\s+", " ", input_str)
-
-    # Remove invalid characters
-    valid_chars = "-_.() %s%s" % (string.ascii_letters, string.digits)
-    input_str = input_str.replace("+"," ") # Canvas default for spaces
-    input_str = input_str.replace(":","-")
-    input_str = input_str.replace("/","-")
-    input_str = "".join(c for c in input_str if c in valid_chars)
-
-    # Remove leading and trailing whitespace
-    input_str = input_str.lstrip().rstrip()
-
-    # Remove trailing periods
-    input_str = input_str.rstrip(".")
-
-    return input_str
-
-def makeValidFolderPath(input_str):
-    # Normalize Unicode and whitespace
-    input_str = unicodedata.normalize('NFKC', input_str)
-    input_str = input_str.replace("\u00A0", " ") # NBSP to space
-    input_str = re.sub(r"\s+", " ", input_str)
-
-    # Remove invalid characters
-    valid_chars = "-_.()/ %s%s" % (string.ascii_letters, string.digits)
-    input_str = input_str.replace("+"," ") # Canvas default for spaces
-    input_str = input_str.replace(":","-")
-    input_str = "".join(c for c in input_str if c in valid_chars)
-
-    # Remove leading and trailing whitespace, separators
-    input_str = input_str.lstrip().rstrip().strip("/").strip("\\")
-
-    # Remove trailing periods
-    input_str = input_str.rstrip(".")
-
-    # Replace path separators with OS default
-    input_str=input_str.replace("/",os.sep)
-
-    return input_str
-
-def shortenFileName(string, shorten_by) -> str:
-    if (not string or shorten_by <= 0):
-        return string
-
-    # Shorten string by specified value + 1 for "-" to indicate incomplete file name (trailing periods not allowed)
-    string = string[:len(string)-(shorten_by + 1)]
-
-    string = string.rstrip().rstrip(".").rstrip("-")
-    string += "-"
-    
-    return string
 
 
 def findCourseModules(course, course_view):
@@ -402,6 +340,8 @@ def findCourseModules(course, course_view):
                     module_item_view.title = str(module_item.title) if hasattr(module_item, "title") else ""
                     # Type
                     module_item_view.content_type = str(module_item.type) if hasattr(module_item, "type") else ""
+                    # ID of the referenced object (page, assignment, ...)
+                    module_item_view.content_id = module_item.content_id if hasattr(module_item, "content_id") else 0
 
                     # URL
                     module_item_view.url = str(module_item.html_url) if hasattr(module_item, "html_url") else ""
@@ -410,7 +350,6 @@ def findCourseModules(course, course_view):
 
                     if module_item_view.content_type == "File":
                         # If problems arise due to long pathnames, changing module.name to module.id might help
-                        # A change would also have to be made in downloadCourseModulePages(api_url, course_view, cookies_path)
                         module_name = makeValidFilename(str(module.name))
                         module_name = shortenFileName(module_name, len(module_name) - MAX_FOLDER_NAME_SIZE)
                         module_dir = os.path.join(modules_dir, module_name, "files")
@@ -433,6 +372,8 @@ def findCourseModules(course, course_view):
                                 print(f"        Downloaded: {module_file.display_name}")
                             else:
                                 print(f"        File already exists: {module_file.display_name}")
+
+                            module_item_view.local_path = os.path.relpath(module_file_path, DL_LOCATION)
                         except Exception as e:
                             error_type, message = CanvasErrorHandler.handle_canvas_exception(
                                 e, "module file download"
@@ -542,12 +483,14 @@ def download_submission_attachments(course, course_view):
                         r.raise_for_status()
                         with open(filepath, 'wb') as f:
                             f.write(r.content)
+                        attachment.local_path = os.path.relpath(filepath, DL_LOCATION)
                         extraction_stats.attachments_downloaded += 1
                         print(f"      ✓ Saved: {attachment.filename}")
                     except Exception as e:
                         print(f"      ❌ Failed to download {attachment.filename}: {e}")
                         extraction_stats.error_count += 1
                 else:
+                    attachment.local_path = os.path.relpath(filepath, DL_LOCATION)
                     print(f"      ✓ Already exists: {attachment.filename}")
 
 
@@ -595,6 +538,8 @@ def findCoursePages(course):
             page_view.title = str(page.title) if hasattr(page, "title") else ""
             # Body
             page_view.body = str(page.body) if hasattr(page, "body") else ""
+            # URL
+            page_view.url = str(page.html_url) if hasattr(page, "html_url") else ""
             # Date created
             try:
                 page_view.created_date = dateutil.parser.parse(page.created_at).strftime(DATE_TEMPLATE) if \
@@ -670,7 +615,7 @@ def findCourseAssignments(course):
 
             try:
                 try: # Download all submissions for entire class
-                    submissions = assignment.get_submissions()
+                    submissions = assignment.get_submissions(include=["submission_history", "submission_comments"])
                     submissions[0] # Trigger Unauthorized if not allowed
                 except (Unauthorized, Forbidden) as e:
                     error_type, message = CanvasErrorHandler.handle_canvas_exception(
@@ -685,7 +630,7 @@ def findCourseAssignments(course):
                         extraction_stats.error_count += 1
                     
                     # Download submission for this user only
-                    submissions = [assignment.get_submission(USER_ID)]
+                    submissions = [assignment.get_submission(USER_ID, include=["submission_history", "submission_comments"])]
                 submissions[0] #throw error if no submissions found at all but without error
             except (ResourceDoesNotExist, NameError, IndexError) as e:
                 error_type, message = CanvasErrorHandler.handle_canvas_exception(
@@ -721,6 +666,17 @@ def findCourseAssignments(course):
                         # Submission comments
                         sub_view.submission_comments = str(submission.submission_comments) if \
                             hasattr(submission, "submission_comments") else ""
+                        # Submission text (online entry), used by the HTML exporter
+                        sub_view.body = str(submission.body) if \
+                            hasattr(submission, "body") and submission.body else ""
+                        # Structured comments for the HTML exporter
+                        comments = getattr(submission, "submission_comments", None)
+                        if isinstance(comments, list):
+                            sub_view.submission_comments_raw = comments
+                        # Attempt history, only returned when explicitly requested
+                        history = getattr(submission, "submission_history", None)
+                        if isinstance(history, list):
+                            sub_view.submission_history = history
                         # Attempt
                         sub_view.attempt = submission.attempt if \
                             hasattr(submission, "attempt") and submission.attempt is not None else 0
@@ -735,22 +691,17 @@ def findCourseAssignments(course):
                         sub_view.ext_url = str(submission.url) if \
                             hasattr(submission, "url") else ""
 
-                        try:
-                            submission.attachments
-                        except AttributeError:
-                            pass  # No attachments message removed for cleaner output
-                        else:
-                            attachment_count = len(submission.attachments) if submission.attachments else 0
-                            if attachment_count > 0:
-                                print(f"        Found {attachment_count} attachments")
-                            for attachment in submission.attachments:
-                                attach_view = attachmentView()
-                                attach_view.url = attachment.url
-                                attach_view.id = attachment.id
-                                attach_view.filename = attachment.filename
-                                sub_view.attachments.append(attach_view)
-                            assignment_view.submissions.append(sub_view)
-                            extraction_stats.submissions_found += 1
+                        attachments = getattr(submission, "attachments", None) or []
+                        if attachments:
+                            print(f"        Found {len(attachments)} attachments")
+                        for attachment in attachments:
+                            attach_view = attachmentView()
+                            attach_view.url = attachment.url
+                            attach_view.id = attachment.id
+                            attach_view.filename = attachment.filename
+                            sub_view.attachments.append(attach_view)
+                        assignment_view.submissions.append(sub_view)
+                        extraction_stats.submissions_found += 1
                 except Exception as e:
                     error_type, message = CanvasErrorHandler.handle_canvas_exception(
                         e, "submission processing"
@@ -936,9 +887,6 @@ def getCourseView(course):
 
     print(f"Working on: {course_view.term}: {course_view.name}")
 
-    # Track HTML pages saved per course
-    html_pages_saved_in_course = 0
-
     # Course assignments
     print("  Getting assignments")
     course_view.assignments = findCourseAssignments(course)
@@ -982,252 +930,19 @@ def exportAllCourseData(course_view):
     extraction_stats.json_files_created += 1
     print(f"      ✓ Data saved to: {course_output_path}")
 
-def _download_page_if_not_exists(url, output_path, cookies_path, additional_args=(), verbose=False):
-    """
-    Downloads a single HTML page if it doesn't exist, updating stats.
-    Returns True if downloaded, False otherwise.
-    """
-    global stop_html_downloads
-    if stop_html_downloads:
-        return False
-        
-    filename = os.path.basename(output_path)
-    print(f"    Downloading: {filename}...")
+def _env_flag(name):
+    """Return True when an environment variable is set to a truthy value."""
+    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
 
-    if not os.path.exists(output_path):
-        output_dir = os.path.dirname(output_path)
-        os.makedirs(output_dir, exist_ok=True)
-        
-        try:
-            download_page(url, cookies_path, output_dir, filename, additional_args, verbose)
-            extraction_stats.html_pages_downloaded += 1
-            print(f"      ✓ Saved: {filename}")
-            return True
-        except Exception as e:
-            print(f"      ❌ Failed: {e}")
-            extraction_stats.error_count += 1
-            if "Authentication failed" in str(e):
-                print("      Stopping all subsequent HTML downloads.")
-                stop_html_downloads = True
-            return False
-    else:
-        print(f"      ✓ Already exists: {filename}")
-        return True # Return True because the file exists, which is a success condition for the caller
 
-def downloadCourseHTML(api_url, cookies_path, verbose=False):
-    if not cookies_path or stop_html_downloads:
-        return 0
-    
-    course_list_path = os.path.join(DL_LOCATION, "course_list.html")
-    url = f"{api_url}/courses/"
-    
-    if _download_page_if_not_exists(url, course_list_path, cookies_path, verbose=verbose):
-        return 1
-    return 0
+def _fetch_front_page_body(course):
+    """Return the course front page HTML, or an empty string when unavailable."""
+    try:
+        front_page = course.show_front_page()
+        return str(getattr(front_page, "body", "") or "")
+    except Exception:
+        return ""
 
-def downloadCourseHomePageHTML(api_url, course_view, cookies_path, verbose=False):
-    if not cookies_path or stop_html_downloads:
-        return 0
-
-    dl_dir = os.path.join(DL_LOCATION, course_view.term, course_view.course_code)
-    homepage_path = os.path.join(dl_dir, "homepage.html")
-    url = f"{api_url}/courses/{course_view.course_id}"
-    
-    if _download_page_if_not_exists(url, homepage_path, cookies_path, verbose=verbose):
-        return 1
-    return 0
-
-def downloadCourseGradesHTML(api_url, course_view, cookies_path, verbose=False):
-    if not cookies_path or stop_html_downloads:
-        return 0
-
-    dl_dir = os.path.join(DL_LOCATION, course_view.term,
-                         course_view.course_code)
-    grades_path = os.path.join(dl_dir, "grades.html")
-    url = f"{api_url}/courses/{course_view.course_id}/grades"
-    additional_args=("--remove-hidden-elements=false",)
-
-    if _download_page_if_not_exists(url, grades_path, cookies_path, additional_args, verbose=verbose):
-        # We only proceed with BeautifulSoup modifications if the file was newly downloaded or already existed.
-        with open(grades_path, "r+t", encoding="utf-8") as grades_file:
-            grades_html = BeautifulSoup(grades_file, "html.parser")
-
-            button = grades_html.select_one("#show_all_details_button")
-            if button is not None:
-                button_class = button.get_attribute_list("class", [])
-                if "showAll" not in button_class:
-                    button_class.append("showAll")
-                button["class"] = button_class
-                button.string = "Hide All Details" # Unfortunately this cannot handle i18n.
-
-            assignments = grades_html.select("tr.student_assignment.editable")
-            for assignment in assignments:
-                assignment_id = str(assignment.get("id", "")).removeprefix("submission_")
-                muted = str(assignment.get("data-muted", "")).casefold() in {"true"}
-                if not muted:
-                    for element in itertools.chain(
-                        grades_html.select(f"#comments_thread_{assignment_id}"),
-                        grades_html.select(f"#rubric_{assignment_id}"),
-                        grades_html.select(f"#grade_info_{assignment_id}"),
-                        grades_html.select(f"#final_grade_info_{assignment_id}"),
-                        grades_html.select(f".parent_assignment_id_{assignment_id}"),
-                    ):
-                        element_style = str(element.get("style", ""))
-                        element_style = re.sub(r"display:\s*none", "", element_style)
-                        element["style"] = element_style
-
-                    assignment_arrow = grades_html.select_one(f"#parent_assignment_id_{assignment_id} i")
-                    if assignment_arrow is not None:
-                        assignment_arrow_class = assignment_arrow.get_attribute_list("class", [])
-                        assignment_arrow_class.remove("icon-arrow-open-end")
-                        assignment_arrow_class.append("icon-arrow-open-down")
-                        assignment_arrow["class"] = assignment_arrow_class
-
-            grades_file.seek(0)
-            grades_file.write(grades_html.prettify(formatter="html"))
-            grades_file.truncate()
-        return 1
-    return 0
-        
-def downloadAssignmentPages(api_url, course_view, cookies_path, verbose=False):
-    pages_saved = 0
-    if not cookies_path or not course_view.assignments or stop_html_downloads:
-        return pages_saved
-
-    base_assign_dir = os.path.join(DL_LOCATION, course_view.term,
-        course_view.course_code, "assignments")
-
-    # Download assignment list page
-    assignment_list_path = os.path.join(base_assign_dir, "assignment_list.html")
-    list_url = f"{api_url}/courses/{course_view.course_id}/assignments/"
-    if _download_page_if_not_exists(list_url, assignment_list_path, cookies_path, verbose=verbose):
-        pages_saved += 1
-
-    for assignment in course_view.assignments:
-        assignment_title = makeValidFilename(str(assignment.title))
-        assignment_title = shortenFileName(assignment_title, len(assignment_title) - MAX_FOLDER_NAME_SIZE)  
-        assign_dir = os.path.join(base_assign_dir, assignment_title)
-
-        if assignment.html_url:
-            assignment_page_path = os.path.join(assign_dir, "assignment.html")
-            if _download_page_if_not_exists(assignment.html_url, assignment_page_path, cookies_path, verbose=verbose):
-                pages_saved += 1
-
-        for submission in assignment.submissions:
-            submission_dir = assign_dir
-
-            if len(assignment.submissions) != 1:
-                submission_dir = os.path.join(assign_dir, str(submission.user_id))
-
-            if submission.preview_url:
-                submission_page_path = os.path.join(submission_dir, "submission.html")
-                if _download_page_if_not_exists(submission.preview_url, submission_page_path, cookies_path, verbose=verbose):
-                    pages_saved += 1
-
-            if (submission.attempt and submission.attempt > 1 and assignment.updated_url and assignment.html_url 
-                and assignment.html_url.rstrip("/") != assignment.updated_url.rstrip("/")):
-                attempts_dir = os.path.join(assign_dir, "attempts")
-                
-                for i in range(submission.attempt):
-                    filename = f"attempt_{i+1}.html"
-                    attempt_path = os.path.join(attempts_dir, filename)
-                    attempt_url = f"{assignment.updated_url}/history?version={i+1}"
-                    if _download_page_if_not_exists(attempt_url, attempt_path, cookies_path, verbose=verbose):
-                        pages_saved += 1
-    return pages_saved
-
-def downloadCourseModulePages(api_url, course_view, cookies_path, verbose=False): 
-    pages_saved = 0
-    if not cookies_path or not course_view.modules or stop_html_downloads:
-        return pages_saved
-
-    modules_dir = os.path.join(DL_LOCATION, course_view.term,
-        course_view.course_code, "modules")
-
-    # Downloads the modules page
-    module_list_path = os.path.join(modules_dir, "modules_list.html")
-    list_url = f"{api_url}/courses/{course_view.course_id}/modules/"
-    if _download_page_if_not_exists(list_url, module_list_path, cookies_path, verbose=verbose):
-        pages_saved += 1
-
-    for module in course_view.modules:
-        for item in module.items:
-            module_name = makeValidFilename(str(module.name))
-            module_name = shortenFileName(module_name, len(module_name) - MAX_FOLDER_NAME_SIZE)
-            items_dir = os.path.join(modules_dir, module_name)
-            
-            if item.url:
-                filename = makeValidFilename(str(item.title)) + ".html"
-                module_item_path = os.path.join(items_dir, filename)
-                if _download_page_if_not_exists(item.url, module_item_path, cookies_path, verbose=verbose):
-                    pages_saved += 1
-    return pages_saved
-
-def downloadCourseAnnouncementPages(api_url, course_view, cookies_path, verbose=False):
-    pages_saved = 0
-    if not cookies_path or not course_view.announcements or stop_html_downloads:
-        return pages_saved
-
-    base_announce_dir = os.path.join(DL_LOCATION, course_view.term,
-        course_view.course_code, "announcements")
-
-    # Download announcement list
-    announcement_list_path = os.path.join(base_announce_dir, "announcement_list.html")
-    list_url = f"{api_url}/courses/{course_view.course_id}/announcements/"
-    if _download_page_if_not_exists(list_url, announcement_list_path, cookies_path, verbose=verbose):
-        pages_saved += 1
-
-    for announcement in course_view.announcements:
-        if not announcement.url:
-            continue
-
-        announcements_title = makeValidFilename(str(announcement.title))
-        announcements_title = shortenFileName(announcements_title, len(announcements_title) - MAX_FOLDER_NAME_SIZE)
-        announce_dir = os.path.join(base_announce_dir, announcements_title)
-
-        if not os.path.exists(announce_dir):
-            os.makedirs(announce_dir)
-
-        for i in range(announcement.amount_pages):
-            filename = f"announcement_{i+1}.html"
-            page_path = os.path.join(announce_dir, filename)
-            page_url = f"{announcement.url}/page-{i+1}"
-            if _download_page_if_not_exists(page_url, page_path, cookies_path, verbose=verbose):
-                pages_saved += 1
-    return pages_saved
-        
-def downloadCourseDiscussionPages(api_url, course_view, cookies_path, verbose=False):
-    pages_saved = 0
-    if not cookies_path or not course_view.discussions or stop_html_downloads:
-        return pages_saved
-
-    base_discussion_dir = os.path.join(DL_LOCATION, course_view.term,
-        course_view.course_code, "discussions")
-
-    # Download discussion list
-    discussion_list_path = os.path.join(base_discussion_dir, "discussion_list.html")
-    list_url = f"{api_url}/courses/{course_view.course_id}/discussion_topics/"
-    if _download_page_if_not_exists(list_url, discussion_list_path, cookies_path, verbose=verbose):
-        pages_saved += 1
-
-    for discussion in course_view.discussions:
-        if not discussion.url:
-            continue
-
-        discussion_title = makeValidFilename(str(discussion.title))
-        discussion_title = shortenFileName(discussion_title, len(discussion_title) - MAX_FOLDER_NAME_SIZE)
-        discussion_dir = os.path.join(base_discussion_dir, discussion_title)
-
-        if not os.path.exists(discussion_dir):
-            os.makedirs(discussion_dir)
-
-        for i in range(discussion.amount_pages):
-            filename = f"discussion_{i+1}.html"
-            page_path = os.path.join(discussion_dir, filename)
-            page_url = f"{discussion.url}/page-{i+1}"
-            if _download_page_if_not_exists(page_url, page_path, cookies_path, verbose=verbose):
-                pages_saved += 1
-    return pages_saved
 
 if __name__ == "__main__":
 
@@ -1236,53 +951,26 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Export nearly all of a student's Canvas LMS data.")
     parser.add_argument("-c", "--config", default=os.environ.get("CANVAS_CONFIG", "credentials.yaml"), help="Path to YAML credentials file (default: credentials.yaml or $CANVAS_CONFIG)")
     parser.add_argument("-o", "--output", default="./output", help="Directory to store exported data (default: ./output)")
-    parser.add_argument("--singlefile", action="store_true", help="Enable HTML snapshot capture with SingleFile (requires Node.js and Chrome/Chromium).")
+    parser.add_argument("--html", action="store_true", default=_env_flag("CANVAS_HTML"), help="Generate HTML pages from Canvas API data (also enabled with CANVAS_HTML=1).")
     parser.add_argument("-v", "--verbose", action="store_true", help="Enable verbose output for debugging.")
-    parser.add_argument("--version", action="version", version="Canvas Student Data Export Tool 1.0")
+    parser.add_argument("--version", action="version", version="Canvas Student Data Export Tool 2.0")
 
     args = parser.parse_args()
 
     # Load credentials from YAML (if present) and let CANVAS_* env vars override.
     creds = _apply_env_overrides(_load_credentials(args.config))
-    
+
     # Validate credentials
     required = ["API_URL", "API_KEY", "USER_ID"]
     missing = [k for k in required if not creds.get(k)]
 
-    # Apply a configured browser path before checking SingleFile availability.
-    chrome_path_override = creds.get("CHROME_PATH")
-    if chrome_path_override:
-        override_chrome_path(chrome_path_override)
-
-    # COOKIES_PATH is required if singlefile is active, but it can be missing.
-    if args.singlefile:
-        # Fail fast when HTML snapshots cannot work at all (e.g. the slim
-        # Docker image, which intentionally ships without Node.js/Chromium).
-        problems = singlefile_requirements()
-        if problems:
-            print("Error: --singlefile is enabled, but HTML snapshots cannot run:")
-            for problem in problems:
-                print(f"  - {problem}")
-            print("Install the missing requirements (see README) or run without --singlefile.")
-            sys.exit(1)
-
-        print("Note: --singlefile is enabled. Please ensure your browser cookies")
-        print("      are fresh by logging into Canvas and then re-exporting")
-        print("      them using the chrome extension right before running this script.\n")
-        if sys.stdin.isatty():
-            input("Press Enter to continue...")
-        else:
-            print("Non-interactive environment detected, continuing...\n")
-        if "COOKIES_PATH" not in creds or not creds["COOKIES_PATH"]:
-            missing.append("COOKIES_PATH")
-
     if missing:
         print(f"Error: {args.config} is missing required field(s): {', '.join(missing)}.")
-        print("Please create the YAML file with the following structure:\n"
+        print("Please create the YAML file with the following structure, or set the\n"
+              "equivalent CANVAS_* environment variables:\n"
               "API_URL: https://<your>.instructure.com\n"
               "API_KEY: <your key>\n"
-              "USER_ID: 123456\n"
-              "COOKIES_PATH: path/to/cookies.txt\n")
+              "USER_ID: 123456\n")
         sys.exit(1)
 
     # Populate globals expected throughout the script
@@ -1293,17 +981,7 @@ if __name__ == "__main__":
     except (TypeError, ValueError):
         print(f"Error: USER_ID must be an integer (got {creds['USER_ID']!r}).")
         sys.exit(1)
-    # Use .get() to safely access optional/conditionally required keys
-    COOKIES_PATH = creds.get("COOKIES_PATH", "")
     COURSES_TO_SKIP = creds.get("COURSES_TO_SKIP", [])
-
-    # Optional: Override SingleFile capture timeout (in seconds)
-    singlefile_timeout_override = creds.get("SINGLEFILE_TIMEOUT")
-    if singlefile_timeout_override is not None:
-        try:
-            override_singlefile_timeout(float(singlefile_timeout_override))
-        except (ValueError, TypeError):
-            print(f"Warning: Invalid SINGLEFILE_TIMEOUT value in {args.config}; using default.")
 
     # Update output directory
     DL_LOCATION = args.output
@@ -1312,7 +990,7 @@ if __name__ == "__main__":
 
     # Initialize a new Canvas object
     canvas = Canvas(API_URL, API_KEY)
-    
+
     # Test the connection and API key
     try:
         user = canvas.get_current_user()
@@ -1328,10 +1006,10 @@ if __name__ == "__main__":
             sys.exit(1)
         else:
             CanvasErrorHandler.log_error(error_type, message, verbose=args.verbose)
- 
+
     print(f"Creating output directory: {DL_LOCATION}\n")
     os.makedirs(DL_LOCATION, exist_ok=True)
- 
+
     all_courses_views = []
 
     print("Getting list of all courses\n")
@@ -1342,19 +1020,18 @@ if __name__ == "__main__":
 
     skip = set(COURSES_TO_SKIP)
 
-
-    if COOKIES_PATH and args.singlefile:
-        print("  Downloading course list page")
-        downloadCourseHTML(API_URL, COOKIES_PATH, verbose=args.verbose)
+    if args.html:
+        print("HTML export enabled: pages will be generated from Canvas API data\n")
 
     for courses in courses_list:
         for course in courses:
             if course.id in skip or not hasattr(course, "name") or not hasattr(course, "term"):
                 continue
-            
-            html_pages_saved_in_course = 0
 
             course_view = getCourseView(course)
+
+            if args.html:
+                course_view.homepage_html = _fetch_front_page_body(course)
 
             all_courses_views.append(course_view)
 
@@ -1367,28 +1044,14 @@ if __name__ == "__main__":
             print("  Getting modules and downloading module files")
             course_view.modules = findCourseModules(course, course_view)
 
-            if COOKIES_PATH and args.singlefile:
-                print("  Downloading course home page")
-                html_pages_saved_in_course += downloadCourseHomePageHTML(API_URL, course_view, COOKIES_PATH, verbose=args.verbose)
-
-                print("  Downloading course grades")
-                html_pages_saved_in_course += downloadCourseGradesHTML(API_URL, course_view, COOKIES_PATH, verbose=args.verbose)
-
-                print("  Downloading assignment pages")
-                html_pages_saved_in_course += downloadAssignmentPages(API_URL, course_view, COOKIES_PATH, verbose=args.verbose)
-
-                print("  Downloading course module pages")
-                html_pages_saved_in_course += downloadCourseModulePages(API_URL, course_view, COOKIES_PATH, verbose=args.verbose)
-
-                print("  Downloading course announcements pages")
-                html_pages_saved_in_course += downloadCourseAnnouncementPages(API_URL, course_view, COOKIES_PATH, verbose=args.verbose)   
-
-                print("  Downloading course discussion pages")
-                html_pages_saved_in_course += downloadCourseDiscussionPages(API_URL, course_view, COOKIES_PATH, verbose=args.verbose)
-
             print("  Exporting all course data")
             exportAllCourseData(course_view)
-            
+
+            html_pages_saved_in_course = 0
+            if args.html:
+                html_pages_saved_in_course = export_course_html(course_view, DL_LOCATION, USER_ID)
+                extraction_stats.html_pages_generated += html_pages_saved_in_course
+
             # Show mini-summary for this course
             assignments_count = len(course_view.assignments)
             submissions_count = sum(len(a.submissions) for a in course_view.assignments)
@@ -1396,16 +1059,19 @@ if __name__ == "__main__":
             pages_count = len(course_view.pages)
             announcements_count = len(course_view.announcements)
             discussions_count = len(course_view.discussions)
-            
+
             print(f"  ✓ Course data exported:")
             print(f"    • {assignments_count} assignments with {submissions_count} submissions (JSON)")
             print(f"    • {modules_count} modules (JSON)")
             print(f"    • {pages_count} pages (JSON)")
             print(f"    • {announcements_count} announcements (JSON)")
             print(f"    • {discussions_count} discussions (JSON)")
-            if COOKIES_PATH and args.singlefile:
-                print(f"    • {html_pages_saved_in_course} HTML snapshots saved")
+            if args.html:
+                print(f"    • {html_pages_saved_in_course} HTML pages generated")
             print()
+
+    if args.html:
+        extraction_stats.html_pages_generated += export_course_list_html(all_courses_views, DL_LOCATION)
 
     print("Exporting data from all courses combined as one file: "
           "all_output.json")
@@ -1415,9 +1081,9 @@ if __name__ == "__main__":
 
     with open(all_output_path, "w") as out_file:
         out_file.write(json_str)
-    
+
     extraction_stats.json_files_created += 1
     print(f"Combined JSON data exported to: {all_output_path}")
 
     print("\nProcess complete. All canvas data exported!")
-    print(extraction_stats.summary(DL_LOCATION, singlefile_enabled=args.singlefile))
+    print(extraction_stats.summary(DL_LOCATION, html_enabled=args.html))
