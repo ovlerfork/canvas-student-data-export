@@ -6,8 +6,6 @@ venv
 __pycache__
 **/__pycache__
 *.pyc
-node_modules
 output
 credentials.yaml
-cookies.txt
 .DS_Store
