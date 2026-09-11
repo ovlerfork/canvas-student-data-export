@@ -541,11 +541,32 @@ def _page_view_from(page):
 def findCoursePages(course):
     page_views = []
 
+    # The list endpoint is paginated and can return page bodies in one request;
+    # ask for them to avoid a detail request per page. PaginatedList fetches
+    # lazily, so listing errors (e.g. a 404 for courses without pages) can also
+    # surface while iterating, not only when the list is created.
     try:
-        # The list endpoint is paginated and can return page bodies in one
-        # request; ask for them to avoid a detail request per page.
         pages = course.get_pages(include=["body"])
+
+        for listed_page in pages:
+            # One failing page must not stop the remaining pages from exporting.
+            try:
+                page = listed_page
+                # Some page types (e.g. block-editor pages) only expose their body
+                # through the detail endpoint, so fall back to a detail request.
+                if not getattr(listed_page, "body", None) and hasattr(listed_page, "url"):
+                    page = course.get_page(listed_page.url)
+
+                page_views.append(_page_view_from(page))
+                extraction_stats.pages_found += 1
+            except Exception as e:
+                error_type, message = CanvasErrorHandler.handle_canvas_exception(
+                    e, "page download"
+                )
+                CanvasErrorHandler.log_error(error_type, message, verbose=args.verbose)
+                extraction_stats.error_count += 1
     except Exception as e:
+        # Keep the pages found so far when the listing itself fails.
         error_msg = str(e)
         if "Not Found" not in error_msg:
             error_type, message = CanvasErrorHandler.handle_canvas_exception(
@@ -556,25 +577,6 @@ def findCoursePages(course):
                 extraction_stats.error_count += 1
             else:
                 extraction_stats.student_limitation_warnings += 1
-        return page_views
-
-    for listed_page in pages:
-        # One failing page must not stop the remaining pages from exporting.
-        try:
-            page = listed_page
-            # Some page types (e.g. block-editor pages) only expose their body
-            # through the detail endpoint, so fall back to a detail request.
-            if not getattr(listed_page, "body", None) and hasattr(listed_page, "url"):
-                page = course.get_page(listed_page.url)
-
-            page_views.append(_page_view_from(page))
-            extraction_stats.pages_found += 1
-        except Exception as e:
-            error_type, message = CanvasErrorHandler.handle_canvas_exception(
-                e, "page download"
-            )
-            CanvasErrorHandler.log_error(error_type, message, verbose=args.verbose)
-            extraction_stats.error_count += 1
 
     return page_views
 
