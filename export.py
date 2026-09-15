@@ -1,5 +1,7 @@
 # built in
+import functools
 import json
+import math
 import os
 import argparse
 import sys
@@ -15,6 +17,11 @@ import yaml
 # local
 from html_export import export_course_html, export_course_list_html
 from naming import MAX_FOLDER_NAME_SIZE, makeValidFilename, makeValidFolderPath, shortenFileName
+
+# Default network timeout (seconds) for Canvas API and file requests.
+# requests has no timeout by default, so a stalled connection (e.g. after a
+# network drop) can block an export run forever.
+DEFAULT_HTTP_TIMEOUT = 60.0
 
 # Canvas API Error Handling Utility
 class CanvasErrorHandler:
@@ -134,6 +141,7 @@ ENV_CREDENTIAL_KEYS = {
     "API_URL": "CANVAS_API_URL",
     "API_KEY": "CANVAS_API_KEY",
     "USER_ID": "CANVAS_USER_ID",
+    "HTTP_TIMEOUT": "CANVAS_HTTP_TIMEOUT",
 }
 
 
@@ -1012,6 +1020,35 @@ def exportAllCourseData(course_view):
     extraction_stats.json_files_created += 1
     print(f"      ✓ Data saved to: {course_output_path}")
 
+def _install_default_http_timeout(timeout_seconds):
+    """Give every canvasapi HTTP request a default timeout.
+
+    canvasapi creates a plain requests.Session without a timeout, so a
+    connection that stalls (dropped network, sleeping host, ...) can block an
+    export forever. requests routes all HTTP verbs through Session.request,
+    so wrapping it covers API calls and file downloads alike.
+    """
+    global _http_timeout_installed
+    if _http_timeout_installed:
+        return
+
+    from canvasapi.requester import Requester
+
+    original_init = Requester.__init__
+
+    def init_with_timeout(self, *args, **kwargs):
+        original_init(self, *args, **kwargs)
+        session = getattr(self, "_session", None)
+        if session is not None:
+            session.request = functools.partial(session.request, timeout=timeout_seconds)
+
+    Requester.__init__ = init_with_timeout
+    _http_timeout_installed = True
+
+
+_http_timeout_installed = False
+
+
 def _env_flag(name):
     """Return True when an environment variable is set to a truthy value."""
     return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
@@ -1067,6 +1104,19 @@ if __name__ == "__main__":
 
     # Update output directory
     DL_LOCATION = args.output
+
+    # Network timeout (seconds): requests has no default, so without this a
+    # dropped connection can hang a run forever.
+    try:
+        http_timeout = float(creds.get("HTTP_TIMEOUT", DEFAULT_HTTP_TIMEOUT))
+        if not math.isfinite(http_timeout) or http_timeout <= 0:
+            http_timeout = DEFAULT_HTTP_TIMEOUT
+    except (TypeError, ValueError):
+        print(f"Warning: Invalid HTTP_TIMEOUT value; using {DEFAULT_HTTP_TIMEOUT:g}s.")
+        http_timeout = DEFAULT_HTTP_TIMEOUT
+    _install_default_http_timeout(http_timeout)
+    if args.verbose:
+        print(f"HTTP timeout: {http_timeout:g}s")
 
     print("\nConnecting to Canvas…\n")
 
