@@ -98,6 +98,7 @@ docker run --rm \
 | `CANVAS_API_URL` | `API_URL` |
 | `CANVAS_API_KEY` | `API_KEY` |
 | `CANVAS_USER_ID` | `USER_ID` |
+| `CANVAS_HTTP_TIMEOUT` | `HTTP_TIMEOUT` (seconds, default `60`) |
 | `CANVAS_HTML` | Generates HTML pages when set to `1`/`true` (default `1` in the container) |
 
 Environment variables override values from the YAML file. The image runs as uid 1000; if the mounted output directory is owned by another user, add `--user "$(id -u):$(id -g)"`.
@@ -121,6 +122,8 @@ API_URL: https://example.instructure.com
 API_KEY: <Your Canvas API token>
 # Your Canvas User ID
 USER_ID: 123456
+# (Optional) Network timeout in seconds for Canvas requests. Default: 60
+# HTTP_TIMEOUT: 60
 # (Optional) A list of course IDs to skip when exporting data.
 # COURSES_TO_SKIP:
 #   - 12345
