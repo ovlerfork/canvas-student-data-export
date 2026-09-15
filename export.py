@@ -15,6 +15,9 @@ import requests
 import yaml
 
 # local
+import markdown_export
+import mistral_ocr
+import notebooklm_upload
 from html_export import export_course_html, export_course_list_html
 from naming import MAX_FOLDER_NAME_SIZE, makeValidFilename, makeValidFolderPath, shortenFileName
 
@@ -89,6 +92,10 @@ class ExtractionStats:
         self.files_downloaded = 0
         self.attachments_downloaded = 0
         self.html_pages_generated = 0
+        self.markdown_files_created = 0
+        self.ocr_files_created = 0
+        self.notebooklm_notebooks = 0
+        self.notebooklm_sources_uploaded = 0
         self.json_files_created = 0
         self.student_limitation_warnings = 0
         self.error_count = 0
@@ -110,6 +117,20 @@ Files Downloaded:
 
         if html_enabled:
             summary_text += f"\n  • {self.html_pages_generated} HTML pages generated"
+
+        if self.markdown_files_created or self.ocr_files_created:
+            summary_text += f"""
+
+Markdown Conversion:
+  • {self.markdown_files_created} files converted to Markdown
+  • {self.ocr_files_created} images/PDFs OCR'd to Markdown"""
+
+        if self.notebooklm_notebooks or self.notebooklm_sources_uploaded:
+            summary_text += f"""
+
+NotebookLM Uploads:
+  • {self.notebooklm_notebooks} notebooks used
+  • {self.notebooklm_sources_uploaded} sources uploaded"""
 
         summary_text += f"""
 
@@ -376,6 +397,7 @@ def findCourseModules(course, course_view):
                             # Download file if it doesn't already exist
                             if not os.path.exists(module_file_path):
                                 module_file.download(module_file_path)
+                                _preserve_mtime(module_file_path, module_file)
                                 extraction_stats.files_downloaded += 1
                                 print(f"        Downloaded: {module_file.display_name}")
                             else:
@@ -457,6 +479,7 @@ def downloadCourseFiles(course, course_view):
             if not os.path.exists(dl_path):
                 try:
                     file.download(dl_path)
+                    _preserve_mtime(dl_path, file)
                     extraction_stats.files_downloaded += 1
                     print(f"      ✓ Saved: {file.display_name}")
                 except Exception as e:
@@ -505,6 +528,7 @@ def download_submission_attachments(course, course_view):
                         r.raise_for_status()
                         with open(filepath, 'wb') as f:
                             f.write(r.content)
+                        _preserve_mtime(filepath, attachment)
                         attachment.local_path = os.path.relpath(filepath, DL_LOCATION)
                         extraction_stats.attachments_downloaded += 1
                         print(f"      ✓ Saved: {attachment.filename}")
@@ -1063,6 +1087,26 @@ def _fetch_front_page_body(course):
         return ""
 
 
+def _preserve_mtime(path, canvas_object):
+    """Copy a Canvas object's timestamp onto a downloaded file.
+
+    Canvas download responses do not carry the remote modification time, so
+    without this every download would look brand new on disk. Keeping the
+    Canvas ``updated_at`` makes the "recently active course" check (used for
+    NotebookLM uploads) meaningful.
+    """
+    for attr in ("updated_at", "modified_at", "created_at"):
+        value = getattr(canvas_object, attr, None)
+        if not value:
+            continue
+        try:
+            timestamp = dateutil.parser.parse(value).timestamp()
+            os.utime(path, (timestamp, timestamp))
+        except (ValueError, TypeError, OverflowError, OSError):
+            pass
+        return
+
+
 if __name__ == "__main__":
 
     print("Welcome to the Canvas Student Data Export Tool\n")
@@ -1071,6 +1115,10 @@ if __name__ == "__main__":
     parser.add_argument("-c", "--config", default=os.environ.get("CANVAS_CONFIG", "credentials.yaml"), help="Path to YAML credentials file (default: credentials.yaml or $CANVAS_CONFIG)")
     parser.add_argument("-o", "--output", default="./output", help="Directory to store exported data (default: ./output)")
     parser.add_argument("--html", action="store_true", default=_env_flag("CANVAS_HTML"), help="Generate HTML pages from Canvas API data (also enabled with CANVAS_HTML=1).")
+    parser.add_argument("--no-markdown", action="store_true", help="Do not convert HTML/Word/PPTX/... files to Markdown.")
+    parser.add_argument("--no-ocr", action="store_true", help="Do not OCR images/PDFs even when MISTRAL_API_KEY is configured.")
+    parser.add_argument("--notebooklm", action="store_true", help="Upload recent courses to NotebookLM (requires NOTEBOOKLM_AUTH_JSON).")
+    parser.add_argument("--no-notebooklm", action="store_true", help="Do not upload courses to NotebookLM, even when NOTEBOOKLM_AUTH_JSON is set.")
     parser.add_argument("-v", "--verbose", action="store_true", help="Enable verbose output for debugging.")
     parser.add_argument("--version", action="version", version="Canvas Student Data Export Tool 2.0")
 
@@ -1117,6 +1165,52 @@ if __name__ == "__main__":
     _install_default_http_timeout(http_timeout)
     if args.verbose:
         print(f"HTTP timeout: {http_timeout:g}s")
+
+    # Markdown conversion: pandoc handles HTML/Word/PPTX/EPUB/..., while pages
+    # written by this tool are converted directly with markdownify.
+    markdown_enabled = not args.no_markdown
+    pandoc_path = markdown_export.find_pandoc() if markdown_enabled else None
+    markdown_generated_ok = markdown_export.markdownify_available() if markdown_enabled else False
+    markdown_effective = markdown_enabled and (bool(pandoc_path) or markdown_generated_ok)
+    if markdown_enabled and not markdown_effective:
+        print("Note: no Markdown converter is available (install pandoc and/or "
+              "markdownify); Markdown conversion is skipped.")
+    elif markdown_enabled and not pandoc_path:
+        print("Note: pandoc was not found. Only HTML pages generated by this tool will be "
+              "converted to Markdown; install pandoc (full build) for Word/PPTX/EPUB/HTML files.")
+
+    # Mistral OCR: only active when an API key is configured (config file wins
+    # over the environment so credentials can live in one place).
+    mistral_api_key = ""
+    if not args.no_ocr:
+        mistral_api_key = str(creds.get("MISTRAL_API_KEY")
+                              or os.environ.get("MISTRAL_API_KEY", "")).strip()
+    if mistral_api_key:
+        print("Mistral OCR enabled: images and PDFs will be converted to Markdown.")
+
+    # NotebookLM uploads are opt-in (or automatic when NOTEBOOKLM_AUTH_JSON is set).
+    notebooklm_upload_enabled = not args.no_notebooklm and (
+        args.notebooklm or notebooklm_upload.notebooklm_enabled()
+    )
+    if notebooklm_upload_enabled:
+        try:
+            notebooklm_months = float(creds.get("NOTEBOOKLM_MONTHS")
+                                      or os.environ.get("CANVAS_NOTEBOOKLM_MONTHS") or 3)
+        except (TypeError, ValueError):
+            notebooklm_months = 3.0
+        if notebooklm_months <= 0:
+            notebooklm_months = 3.0
+        notebooklm_max_age_days = int(round(notebooklm_months * 30.44))
+        try:
+            notebooklm_max_sources = int(creds.get("NOTEBOOKLM_MAX_SOURCES")
+                                         or os.environ.get("CANVAS_NOTEBOOKLM_MAX_SOURCES") or 300)
+        except (TypeError, ValueError):
+            notebooklm_max_sources = 300
+        if notebooklm_max_sources <= 0:
+            notebooklm_max_sources = 300
+        notebooklm_state_path = os.path.join(DL_LOCATION, notebooklm_upload.STATE_FILE_NAME)
+        print(f"NotebookLM upload enabled: courses active within the last "
+              f"{notebooklm_months:g} months (max {notebooklm_max_sources} sources per notebook).")
 
     print("\nConnecting to Canvas…\n")
 
@@ -1167,6 +1261,9 @@ if __name__ == "__main__":
 
             all_courses_views.append(course_view)
 
+            course_dir = os.path.join(DL_LOCATION, course_view.term,
+                                      course_view.course_code)
+
             print("  Downloading all files")
             downloadCourseFiles(course, course_view)
 
@@ -1183,6 +1280,39 @@ if __name__ == "__main__":
             if args.html:
                 html_pages_saved_in_course = export_course_html(course_view, DL_LOCATION, USER_ID)
                 extraction_stats.html_pages_generated += html_pages_saved_in_course
+
+            # --- Markdown conversion (HTML/Word/... -> .md) ------------------
+            if markdown_effective:
+                converted = markdown_export.convert_tree(course_dir, pandoc=pandoc_path)
+                if converted:
+                    extraction_stats.markdown_files_created += len(converted)
+                    print(f"  ✓ Converted {len(converted)} files to Markdown")
+
+            # --- Mistral OCR (images/PDFs -> .md) ---------------------------
+            if mistral_api_key:
+                ocr_written = mistral_ocr.ocr_tree(
+                    course_dir, mistral_api_key, timeout=http_timeout, verbose=args.verbose
+                )
+                if ocr_written:
+                    extraction_stats.ocr_files_created += len(ocr_written)
+                    print(f"  ✓ OCR'd {len(ocr_written)} images/PDFs to Markdown")
+
+            # --- NotebookLM upload (recent courses only) --------------------
+            if notebooklm_upload_enabled:
+                last_modified = notebooklm_upload.course_last_modified(course_view, course_dir)
+                if notebooklm_upload.is_recent(last_modified, max_age_days=notebooklm_max_age_days):
+                    notebook_title = f"{course_view.term} - {course_view.course_code} - {course_view.name}".strip(" -")
+                    upload_stats = notebooklm_upload.upload_course(
+                        notebook_title, course_dir, last_modified, notebooklm_state_path,
+                        max_age_days=notebooklm_max_age_days,
+                        max_sources=notebooklm_max_sources,
+                        verbose=args.verbose,
+                    )
+                    if upload_stats:
+                        extraction_stats.notebooklm_notebooks += 1
+                        extraction_stats.notebooklm_sources_uploaded += upload_stats.get("uploaded", 0)
+                else:
+                    print("  Note: course is older than the NotebookLM window; skipping upload")
 
             # Show mini-summary for this course
             assignments_count = len(course_view.assignments)

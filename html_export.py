@@ -8,12 +8,19 @@ point back to Canvas.
 
 import html
 import os
+import re
 import urllib.parse
+
+from bs4 import BeautifulSoup
 
 from naming import MAX_FOLDER_NAME_SIZE, makeValidFilename, shortenFileName
 
 # Canvas shows roughly 50 discussion/announcement entries per page.
 ENTRIES_PER_PAGE = 50
+
+# Embedded in every page we generate so downstream tooling (markdown
+# conversion, NotebookLM uploads) can recognise files written by this exporter.
+GENERATOR_META = '<meta name="generator" content="canvas-student-data-export">'
 
 STYLESHEET = """
 :root { color-scheme: light dark; }
@@ -40,6 +47,7 @@ def _page(title, body, back_link=None):
     return (
         '<!DOCTYPE html>\n<html lang="en">\n<head>\n<meta charset="utf-8">\n'
         '<meta name="viewport" content="width=device-width, initial-scale=1">\n'
+        f"{GENERATOR_META}\n"
         f"<title>{html.escape(title)}</title>\n<style>{STYLESHEET}</style>\n"
         f"</head>\n<body>\n<main>\n{back}<h1>{html.escape(title)}</h1>\n{body}\n</main>\n</body>\n</html>\n"
     )
@@ -81,6 +89,36 @@ def _rich_text_html(value, empty_message):
     if not value or str(value) == "None":
         return f"<p><em>{html.escape(empty_message)}</em></p>"
     return str(value)
+
+
+def _text_content(value):
+    """Return the visible text of a Canvas rich text value ("" when blank)."""
+    if value is None:
+        return ""
+    text = str(value)
+    if text.strip().lower() in ("", "none", "null"):
+        return ""
+    try:
+        text = BeautifulSoup(text, "html.parser").get_text(" ", strip=True)
+    except Exception:
+        text = re.sub(r"<[^>]+>", " ", text)
+    return html.unescape(text).replace("\u00a0", " ").strip()
+
+
+def _has_text(value):
+    """True when a Canvas rich text value holds actual information.
+
+    Canvas happily returns empty paragraphs, bare metadata and literal "None"
+    bodies; pages that would only repeat that boilerplate are not worth saving.
+    """
+    return bool(_text_content(value))
+
+
+def _doc_link(from_path, to_path, label):
+    """Link to a generated page, or render plain text when it was not written."""
+    if to_path:
+        return f'<a href="{_rel_link(from_path, to_path)}">{_escape(label)}</a>'
+    return _escape(label)
 
 
 def _meta_line(*parts):
@@ -130,6 +168,26 @@ def _attachments_html(sub_view, output_dir, page_path):
         else:
             rows.append(f"<li>{_anchor(attachment.url, attachment.filename)}</li>")
     return "<h3>Attachments</h3><ul>" + "".join(rows) + "</ul>"
+
+
+def _submission_has_content(sub_view):
+    """True when a submission is worth a page of its own.
+
+    Grades/scores alone are metadata, not content: a submission needs text,
+    attachments or comments to justify a generated page.
+    """
+    if _has_text(getattr(sub_view, "body", "")):
+        return True
+    if getattr(sub_view, "attachments", None):
+        return True
+    comments = getattr(sub_view, "submission_comments_raw", None)
+    if isinstance(comments, list) and any(
+        isinstance(comment, dict) and _has_text(comment.get("comment", ""))
+        for comment in comments
+    ):
+        return True
+    legacy = getattr(sub_view, "submission_comments", "")
+    return bool(legacy) and _has_text(legacy)
 
 
 def _submission_html(sub_view, output_dir, page_path, attempt_links=()):
@@ -279,6 +337,43 @@ def _section_links(course_dir, home_path, course_view):
     )
 
 
+def _thread_entries_has_content(entries):
+    for entry in entries:
+        if _has_text(getattr(entry, "body", "")):
+            return True
+        for reply in getattr(entry, "topic_replies", []) or []:
+            if _has_text(getattr(reply, "body", "")):
+                return True
+    return False
+
+
+def _thread_has_content(thread):
+    """True when an announcement/discussion has a body or non-empty entries."""
+    return _has_text(getattr(thread, "body", "")) or _thread_entries_has_content(
+        thread.topic_entries
+    )
+
+
+def _module_item_has_page(item, context):
+    """True when a module item page would contain something worth saving.
+
+    Module items such as quizzes or external links would only render an
+    "Open in Canvas" boilerplate page; those are linked from the module list
+    instead of being written to disk.
+    """
+    content_type = item.content_type or ""
+    if content_type == "Page":
+        page = context["pages"].get(item.content_id)
+        return page is not None and _has_text(page.body)
+    if content_type == "Assignment":
+        return item.content_id in context["assignment_paths"]
+    if content_type == "Discussion":
+        return item.content_id in context["discussion_paths"]
+    if content_type == "File":
+        return bool(getattr(item, "local_path", ""))
+    return False
+
+
 def export_course_html(course_view, output_dir, user_id):
     """Write every HTML page for one course. Returns the page count."""
     count = 0
@@ -309,6 +404,31 @@ def export_course_html(course_view, output_dir, user_id):
 
     page_views = {page.id: page for page in course_view.pages}
 
+    # Which pages hold actual information? Pages that would only contain a
+    # title plus metadata (e.g. "Quiz 1 / Assigned: ... / No description.") are
+    # not written at all, so links to them fall back to plain text below.
+    assignment_page_paths = {}
+    submission_page_paths = {}
+    for assignment in course_view.assignments:
+        if _has_text(assignment.description):
+            assignment_page_paths[assignment.id] = assignment_paths[assignment.id]
+        submission = _user_submission(assignment, user_id)
+        if submission is not None and _submission_has_content(submission):
+            submission_page_paths[assignment.id] = os.path.join(
+                os.path.dirname(assignment_paths[assignment.id]), "submission.html"
+            )
+
+    announcement_page_paths = {
+        announcement.id: announcement_paths[announcement.id]
+        for announcement in course_view.announcements
+        if _thread_has_content(announcement)
+    }
+    discussion_page_paths = {
+        discussion.id: discussion_paths[discussion.id]
+        for discussion in course_view.discussions
+        if _thread_has_content(discussion)
+    }
+
     # --- homepage -----------------------------------------------------------
     body = _rich_text_html(course_view.homepage_html, "No front page is available for this course.")
     section_links = _section_links(course_dir, home_path, course_view)
@@ -330,7 +450,7 @@ def export_course_html(course_view, output_dir, user_id):
                 else ""
             )
             rows.append(
-                f'<tr><td>{_anchor(_rel_link(grades_path, assignment_paths[assignment.id]), assignment.title)}</td>'
+                f'<tr><td>{_doc_link(grades_path, assignment_page_paths.get(assignment.id), assignment.title)}</td>'
                 f"<td>{_escape(assignment.due_date)}</td><td>{_escape(grade)}</td>"
                 f"<td>{_escape(score)}</td></tr>"
             )
@@ -349,8 +469,7 @@ def export_course_html(course_view, output_dir, user_id):
         rows = []
         for assignment in course_view.assignments:
             rows.append(
-                f'<tr><td><a href="{_rel_link(assignment_list, assignment_paths[assignment.id])}">'
-                f"{_escape(assignment.title)}</a></td>"
+                f'<tr><td>{_doc_link(assignment_list, assignment_page_paths.get(assignment.id), assignment.title)}</td>'
                 f"<td>{_escape(assignment.due_date)}</td></tr>"
             )
         _write(
@@ -362,26 +481,28 @@ def export_course_html(course_view, output_dir, user_id):
         count += 1
 
     for assignment in course_view.assignments:
-        assignment_path = assignment_paths[assignment.id]
-        body = _meta_line(f"Assigned: {assignment.assigned_date}", f"Due: {assignment.due_date}")
-        body += _rich_text_html(assignment.description, "No description.")
-        _write(
-            assignment_path,
-            assignment.title,
-            body,
-            back_link=_rel_link(assignment_path, os.path.join(course_dir, "assignments", "assignment_list.html")),
-        )
-        count += 1
+        assignment_path = assignment_page_paths.get(assignment.id)
+        if assignment_path:
+            body = _meta_line(f"Assigned: {assignment.assigned_date}", f"Due: {assignment.due_date}")
+            body += _rich_text_html(assignment.description, "No description.")
+            _write(
+                assignment_path,
+                assignment.title,
+                body,
+                back_link=_rel_link(assignment_path, os.path.join(course_dir, "assignments", "assignment_list.html")),
+            )
+            count += 1
 
         submission = _user_submission(assignment, user_id)
-        if submission is not None:
-            submission_path = os.path.join(os.path.dirname(assignment_path), "submission.html")
+        submission_path = submission_page_paths.get(assignment.id)
+        if submission is not None and submission_path:
             attempt_links = _write_attempt_pages(submission, submission_path, assignment.title)
+            back_path = assignment_path or os.path.join(course_dir, "assignments", "assignment_list.html")
             _write(
                 submission_path,
                 f"Submission - {assignment.title}",
                 _submission_html(submission, output_dir, submission_path, attempt_links),
-                back_link=_rel_link(submission_path, assignment_path),
+                back_link=_rel_link(submission_path, back_path),
             )
             count += len(attempt_links) + 1
 
@@ -391,8 +512,7 @@ def export_course_html(course_view, output_dir, user_id):
         rows = []
         for announcement in course_view.announcements:
             rows.append(
-                f'<tr><td><a href="{_rel_link(announcement_list, announcement_paths[announcement.id])}">'
-                f"{_escape(announcement.title)}</a></td>"
+                f'<tr><td>{_doc_link(announcement_list, announcement_page_paths.get(announcement.id), announcement.title)}</td>'
                 f"<td>{_escape(announcement.author)}</td>"
                 f"<td>{_escape(announcement.posted_date)}</td></tr>"
             )
@@ -406,6 +526,8 @@ def export_course_html(course_view, output_dir, user_id):
         count += 1
 
     for announcement in course_view.announcements:
+        if announcement.id not in announcement_page_paths:
+            continue
         folder = os.path.join(course_dir, "announcements", _folder_name(announcement.title))
         header = _meta_line(announcement.author, announcement.posted_date)
         header += _rich_text_html(announcement.body, "No content.")
@@ -424,8 +546,7 @@ def export_course_html(course_view, output_dir, user_id):
         rows = []
         for discussion in course_view.discussions:
             rows.append(
-                f'<tr><td><a href="{_rel_link(discussion_list, discussion_paths[discussion.id])}">'
-                f"{_escape(discussion.title)}</a></td>"
+                f'<tr><td>{_doc_link(discussion_list, discussion_page_paths.get(discussion.id), discussion.title)}</td>'
                 f"<td>{_escape(discussion.author)}</td>"
                 f"<td>{_escape(discussion.posted_date)}</td></tr>"
             )
@@ -439,6 +560,8 @@ def export_course_html(course_view, output_dir, user_id):
         count += 1
 
     for discussion in course_view.discussions:
+        if discussion.id not in discussion_page_paths:
+            continue
         folder = os.path.join(course_dir, "discussions", _folder_name(discussion.title))
         header = _meta_line(discussion.author, discussion.posted_date)
         header += _rich_text_html(discussion.body, "No content.")
@@ -455,6 +578,12 @@ def export_course_html(course_view, output_dir, user_id):
     if course_view.modules:
         modules_dir = os.path.join(course_dir, "modules")
         modules_list = os.path.join(modules_dir, "modules_list.html")
+        context = {
+            "pages": page_views,
+            "assignments": assignment_views,
+            "assignment_paths": assignment_page_paths,
+            "discussion_paths": discussion_page_paths,
+        }
         sections = []
         for module in course_view.modules:
             module_folder = os.path.join(modules_dir, _folder_name(module.name))
@@ -464,10 +593,15 @@ def export_course_html(course_view, output_dir, user_id):
                     items.append(f"<li><strong>{_escape(item.title)}</strong></li>")
                     continue
                 item_path = os.path.join(module_folder, _safe_name(item.title) + ".html")
-                items.append(
-                    f'<li><a href="{_rel_link(modules_list, item_path)}">{_escape(item.title)}</a>'
-                    f' <span class="meta">({_escape(item.content_type or "link")})</span></li>'
-                )
+                meta = f' <span class="meta">({_escape(item.content_type or "link")})</span>'
+                if _module_item_has_page(item, context):
+                    items.append(
+                        f'<li><a href="{_rel_link(modules_list, item_path)}">{_escape(item.title)}</a>{meta}</li>'
+                    )
+                else:
+                    canvas_url = item.external_url or item.url
+                    label = _anchor(canvas_url, item.title) if canvas_url else _escape(item.title)
+                    items.append(f"<li>{label}{meta}</li>")
             sections.append(
                 f"<h2>{_escape(module.name)}</h2>"
                 '<ul class="items">' + "".join(items) + "</ul>"
@@ -480,16 +614,10 @@ def export_course_html(course_view, output_dir, user_id):
         )
         count += 1
 
-        context = {
-            "pages": page_views,
-            "assignments": assignment_views,
-            "assignment_paths": assignment_paths,
-            "discussion_paths": discussion_paths,
-        }
         for module in course_view.modules:
             module_folder = os.path.join(modules_dir, _folder_name(module.name))
             for item in module.items:
-                if item.content_type == "SubHeader":
+                if not _module_item_has_page(item, context):
                     continue
                 item_path = os.path.join(module_folder, _safe_name(item.title) + ".html")
                 _write(
@@ -523,8 +651,10 @@ def _module_item_body(item, context, item_path, output_dir):
         if assignment:
             body = _meta_line(f"Due: {assignment.due_date}")
             body += _rich_text_html(assignment.description, "No description.")
-            link = _rel_link(item_path, context["assignment_paths"][item.content_id])
-            return body + f'<p><a href="{link}">Open the full assignment page</a></p>'
+            if item.content_id in context["assignment_paths"]:
+                link = _rel_link(item_path, context["assignment_paths"][item.content_id])
+                body += f'<p><a href="{link}">Open the full assignment page</a></p>'
+            return body
         return _module_item_link(item)
 
     if content_type == "Discussion":

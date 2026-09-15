@@ -3,17 +3,53 @@
 # Canvas Student Data Export Tool - API only, no browser or Node.js required.
 FROM python:3.12-slim AS runtime
 
+# Image variant:
+#   slim (default) - Canvas export, optional Mistral OCR, JSON/HTML output
+#   full           - adds Markdown conversion and NotebookLM uploads
+ARG CANVAS_VARIANT=slim
+
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
-    PIP_NO_CACHE_DIR=1
+    PIP_NO_CACHE_DIR=1 \
+    CANVAS_VARIANT=${CANVAS_VARIANT}
+
+# The distribution pandoc package ships a reduced build without the pptx/xlsx
+# readers, so the full variant downloads the official release instead, which
+# converts every supported format (HTML, Word, PowerPoint, Excel, EPUB, ...) to
+# Markdown. No ImageMagick is installed, so EMF images extracted from documents
+# are left untouched.
+ARG PANDOC_VERSION=3.11
+ARG TARGETARCH
+RUN set -eux; \
+    case "$CANVAS_VARIANT" in slim|full) ;; *) echo "CANVAS_VARIANT must be 'slim' or 'full' (got '$CANVAS_VARIANT')" >&2; exit 1 ;; esac; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends ca-certificates; \
+    if [ "$CANVAS_VARIANT" = "full" ]; then \
+        apt-get install -y --no-install-recommends curl; \
+        case "${TARGETARCH:-$(dpkg --print-architecture)}" in \
+            amd64) pandoc_arch=amd64 ;; \
+            arm64) pandoc_arch=arm64 ;; \
+            *) echo "Unsupported architecture for pandoc: ${TARGETARCH:-$(dpkg --print-architecture)}" >&2; exit 1 ;; \
+        esac; \
+        curl -fsSL "https://github.com/jgm/pandoc/releases/download/${PANDOC_VERSION}/pandoc-${PANDOC_VERSION}-linux-${pandoc_arch}.tar.gz" -o /tmp/pandoc.tar.gz; \
+        tar -xzf /tmp/pandoc.tar.gz -C /usr/local --strip-components=1 --no-same-owner; \
+        rm /tmp/pandoc.tar.gz; \
+        pandoc --version; \
+    fi; \
+    rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-COPY requirements.txt ./
-RUN pip install --no-cache-dir -r requirements.txt
+COPY requirements.txt requirements-full.txt ./
+RUN set -eux; \
+    if [ "$CANVAS_VARIANT" = "full" ]; then \
+        pip install --no-cache-dir -r requirements-full.txt; \
+    else \
+        pip install --no-cache-dir -r requirements.txt; \
+    fi
 
-COPY export.py html_export.py naming.py ./
+COPY export.py html_export.py naming.py markdown_export.py mistral_ocr.py notebooklm_upload.py ./
 
 # Run as a regular user (uid 1000 usually matches the host user, which keeps
 # bind-mounted output directories writable on Linux). Use `--user` to override.

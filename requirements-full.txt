@@ -1,0 +1,7 @@
+# Full image variant: everything in the slim image plus Markdown conversion
+# and NotebookLM uploads.
+-r requirements.txt
+
+markdownify
+# Auth via NOTEBOOKLM_AUTH_JSON, no browser needed. Requires Python 3.10+.
+notebooklm-py>=0.8,<1; python_version >= "3.10"

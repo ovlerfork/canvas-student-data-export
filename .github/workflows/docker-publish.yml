@@ -10,8 +10,12 @@ on:
       - "Dockerfile"
       - "export.py"
       - "html_export.py"
+      - "markdown_export.py"
+      - "mistral_ocr.py"
       - "naming.py"
+      - "notebooklm_upload.py"
       - "requirements.txt"
+      - "requirements-full.txt"
   pull_request:
     branches: [master]
     paths:
@@ -20,13 +24,13 @@ on:
       - "Dockerfile"
       - "export.py"
       - "html_export.py"
+      - "markdown_export.py"
+      - "mistral_ocr.py"
       - "naming.py"
+      - "notebooklm_upload.py"
       - "requirements.txt"
+      - "requirements-full.txt"
   workflow_dispatch:
-
-concurrency:
-  group: docker-${{ github.ref }}
-  cancel-in-progress: true
 
 env:
   REGISTRY: ghcr.io
@@ -34,11 +38,26 @@ env:
 
 jobs:
   build:
-    name: Build image
+    name: Build ${{ matrix.variant }} image
     runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Default image: Canvas export, optional Mistral OCR, JSON/HTML output.
+          - variant: slim
+            flavor: ""
+          # Full image: adds Markdown conversion and NotebookLM uploads.
+          # Every commit publishes both variants: `sha-xxxxxxx` and
+          # `sha-xxxxxxx-full`, `latest` and `latest-full`, ...
+          - variant: full
+            flavor: "suffix=-full,onlatest=true"
+    concurrency:
+      group: docker-${{ github.ref }}-${{ matrix.variant }}
+      cancel-in-progress: true
 
     steps:
       - name: Checkout
@@ -63,6 +82,7 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          flavor: ${{ matrix.flavor }}
           tags: |
             type=raw,value=latest,enable=${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) || startsWith(github.ref, 'refs/tags/v') }}
             type=ref,event=branch
@@ -81,16 +101,24 @@ jobs:
           push: ${{ github.event_name != 'pull_request' }}
           load: ${{ github.event_name == 'pull_request' }}
           provenance: ${{ github.event_name != 'pull_request' }}
+          build-args: |
+            CANVAS_VARIANT=${{ matrix.variant }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: type=gha,scope=${{ matrix.variant }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.variant }}
 
       - name: Smoke test
         run: |
           image="$(printf '%s\n' '${{ steps.meta.outputs.tags }}' | head -n1)"
-          echo "Testing $image"
+          echo "Testing $image (${{ matrix.variant }})"
           if [ "${{ github.event_name }}" != "pull_request" ]; then
             docker pull "$image"
           fi
           docker run --rm "$image" --help
+          if [ "${{ matrix.variant }}" = "full" ]; then
+            docker run --rm --entrypoint pandoc "$image" --version
+            docker run --rm --entrypoint python "$image" -c "import notebooklm; print('notebooklm-py import OK')"
+          else
+            ! docker run --rm --entrypoint python "$image" -c "import notebooklm" >/dev/null 2>&1
+          fi
