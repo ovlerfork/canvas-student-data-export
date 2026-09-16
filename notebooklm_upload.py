@@ -47,7 +47,7 @@ STATE_FILE_NAME = ".notebooklm_state.json"
 # next to anything else (e.g. `.json`, `.zip`) is a real file and is kept.
 _CONVERSION_SOURCE_EXTENSIONS = SUPPORTED_EXTENSIONS | {
     ".html", ".htm", ".doc", ".docx", ".odt", ".epub", ".rtf", ".txt",
-    ".pptx", ".xlsx", ".tex", ".rst", ".org", ".csv",
+    ".pptx", ".xlsx", ".ipynb", ".tex", ".rst", ".org", ".csv",
 }
 
 # Markers shared with the markdown exporter. These are duplicated here so this

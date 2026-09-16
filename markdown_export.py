@@ -41,12 +41,34 @@ GENERATED_HTML_MARKER = 'name="generator" content="canvas-student-data-export"'
 # downstream tooling (e.g. NotebookLM uploads) can recognise them.
 GENERATED_MD_MARKER = "<!-- generated-by: canvas-student-data-export -->"
 
-# Lowercase extensions pandoc can read here. .doc is deliberately excluded
-# because pandoc has no reader for the legacy binary format.
+# Lowercase extensions pandoc can read here. Only structured/heavy document
+# formats are converted; plain text data (txt, csv, tsv, dat, ...) is left as
+# it is. .doc is intentionally excluded because pandoc has no reader for the
+# legacy binary format.
 PANDOC_EXTENSIONS = {
-    ".html", ".htm", ".docx", ".odt", ".epub", ".rtf", ".txt", ".pptx",
-    ".xlsx", ".tex", ".rst", ".org", ".csv",
+    ".html", ".htm", ".docx", ".odt", ".epub", ".rtf", ".pptx",
+    ".xlsx", ".ipynb", ".tex", ".rst", ".org",
 }
+
+# Code/text formats that carry information but that NotebookLM does not accept
+# (and that have no pandoc reader): the file is copied to "<name>.md"
+# unchanged, so "adding the suffix" is enough to upload it. Data formats like
+# .dat/.npy/.zip are deliberately absent.
+TEXT_COPY_EXTENSIONS = {
+    ".py", ".pyw", ".pyi", ".r", ".rmd", ".rmarkdown", ".jl", ".m",
+    ".java", ".c", ".h", ".cc", ".cpp", ".cxx", ".hpp", ".cs", ".fs",
+    ".js", ".mjs", ".cjs", ".jsx", ".ts", ".tsx", ".sh", ".bash",
+    ".zsh", ".fish", ".ps1", ".bat", ".cmd", ".sql", ".go", ".rs",
+    ".kt", ".kts", ".swift", ".php", ".pl", ".pm", ".rb", ".lua",
+    ".scala", ".groovy", ".hs", ".clj", ".cljs", ".ex", ".exs",
+    ".erl", ".hrl", ".vb", ".asm", ".s", ".f", ".f90", ".f95",
+    ".do", ".sas", ".vhd", ".v", ".sv", ".tcl", ".dart", ".zig",
+    ".nim", ".sol", ".css", ".scss", ".sass", ".less", ".xml",
+    ".yaml", ".yml", ".toml", ".ini", ".cfg", ".conf", ".properties",
+    ".gradle", ".cmake",
+}
+
+# Refuse to copy absurdly large "text" files.
 
 # pandoc reader/writer options used by the original .bat file.
 _PANDOC_INPUT_FORMAT = (
@@ -60,6 +82,7 @@ _PANDOC_OUTPUT_FORMAT = (
 
 _PANDOC_TIMEOUT = 600.0
 _MAGICK_TIMEOUT = 120.0
+_TEXT_COPY_MAX_BYTES = 5 * 1024 * 1024
 
 # Lua filter matching the original clean.lua, extended with the wrapper classes
 # used by the HTML pages this tool generates (main/comment/reply), so all HTML
@@ -76,6 +99,10 @@ local unwrap_classes = {
   main = true,
   comment = true,
   reply = true,
+  cell = true,
+  output = true,
+  stream = true,
+  stdout = true,
 }
 
 function Div(el)
@@ -143,6 +170,11 @@ def attachment_dir_for(source_path: str) -> str:
 
 def _md_path_for(source_path):
     return os.path.splitext(source_path)[0] + ".md"
+
+
+def _text_copy_path_for(source_path):
+    """Output path for a code/text copy: the full name plus ".md"."""
+    return os.path.abspath(source_path) + ".md"
 
 
 def _cleanup_markdown(text):
@@ -298,6 +330,45 @@ def generated_html_to_markdown(html_path: str, md_path: Optional[str] = None,
         return None
 
 
+def copy_text_to_markdown(source_path, force=False):
+    """Copy a code/text file to "<name>.md" unchanged.
+
+    NotebookLM does not accept these extensions and the content is plain text,
+    so adding the .md suffix is enough. Returns the md path written or None.
+    Never raises.
+    """
+    try:
+        source_path = os.path.abspath(source_path)
+        md_path = _text_copy_path_for(source_path)
+        if os.path.exists(md_path) and not force:
+            return None
+        try:
+            size = os.path.getsize(source_path)
+        except OSError:
+            return None
+        if size == 0 or size > _TEXT_COPY_MAX_BYTES:
+            return None
+        with open(source_path, "rb") as f:
+            raw = f.read(_TEXT_COPY_MAX_BYTES + 1)
+        if b"\x00" in raw[:8192]:
+            return None
+        text = raw.decode("utf-8", errors="replace").lstrip("\ufeff")
+        if not text.strip():
+            return None
+        if force and os.path.exists(md_path):
+            try:
+                os.remove(md_path)
+            except OSError:
+                pass
+        with open(md_path, "w", encoding="utf-8") as f:
+            f.write(text)
+        _sync_mtime(source_path, md_path)
+        return md_path
+    except Exception as e:
+        print(f"    ERROR: copying {source_path} to Markdown: {e}")
+        return None
+
+
 def convert_file(source_path: str, pandoc: Optional[str] = None, force: bool = False) -> Optional[str]:
     """Convert one file to `<stem>.md` next to it.
 
@@ -313,6 +384,18 @@ def convert_file(source_path: str, pandoc: Optional[str] = None, force: bool = F
 
         ext = os.path.splitext(source_path)[1].lower()
         output_path = _md_path_for(source_path)
+
+        if ext in TEXT_COPY_EXTENSIONS:
+            output_path = _text_copy_path_for(source_path)
+            if os.path.exists(output_path) and not force:
+                print(f"    Skipping: {output_path} already exists")
+                return None
+            result = copy_text_to_markdown(source_path, force=force)
+            if result:
+                print(f"    ✓ Converted (text copy): {source_path} -> {result}")
+            else:
+                print(f"    Skipping: no text content to copy from {source_path}")
+            return result
 
         if is_generated_html(source_path):
             if os.path.exists(output_path) and not force:
@@ -388,7 +471,7 @@ def convert_tree(root: str, pandoc: Optional[str] = None, force: bool = False) -
             )
             for name in sorted(filenames):
                 ext = os.path.splitext(name)[1].lower()
-                if ext not in PANDOC_EXTENSIONS:
+                if ext not in PANDOC_EXTENSIONS and ext not in TEXT_COPY_EXTENSIONS:
                     continue
                 path = os.path.join(dirpath, name)
                 result = convert_file(path, pandoc=tool, force=force)
