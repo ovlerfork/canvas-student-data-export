@@ -9,10 +9,16 @@ returned Markdown to those relative paths.
 This module never talks to the network at import time and never requires an API
 key just to be imported. Error handling is best-effort: ``ocr_file`` and
 ``ocr_tree`` never raise.
+
+Requests are throttled to about one page per second (configurable through the
+``MISTRAL_OCR_INTERVAL`` environment variable or the ``min_interval``
+argument) and retried with backoff on HTTP 429/5xx, because Mistral rate limits
+the OCR endpoint aggressively.
 """
 
 import base64
 import os
+import time
 
 import requests
 
@@ -27,6 +33,13 @@ OCR_EXTENSIONS = {
 MISTRAL_OCR_URL = "https://api.mistral.ai/v1/ocr"
 DEFAULT_OCR_MODEL = "mistral-ocr-latest"
 DEFAULT_OCR_TIMEOUT = 120.0
+
+# OCR is rate limited to one page per second by default.
+DEFAULT_MIN_REQUEST_INTERVAL = 1.0
+DEFAULT_MAX_RETRIES = 5
+
+# Earliest monotonic time at which the next OCR request may start.
+_last_request_at = 0.0
 
 # Mistral rejects data URIs above roughly 50 MB. The data URI is slightly
 # larger than the base64 payload alone, so comparing against the encoded
@@ -51,6 +64,74 @@ _IMAGE_MIME_TYPES = {
 def ocr_configured(api_key):
     """True when an API key is present."""
     return bool(api_key) and bool(str(api_key).strip())
+
+
+def _resolve_interval(min_interval):
+    """Seconds charged per OCR page (argument, MISTRAL_OCR_INTERVAL or default)."""
+    if min_interval is not None:
+        try:
+            return max(0.0, float(min_interval))
+        except (TypeError, ValueError):
+            pass
+    try:
+        return max(0.0, float(os.environ.get(
+            "MISTRAL_OCR_INTERVAL", DEFAULT_MIN_REQUEST_INTERVAL)))
+    except (TypeError, ValueError):
+        return DEFAULT_MIN_REQUEST_INTERVAL
+
+
+def _throttle(interval):
+    """Sleep until the rate budget allows the next OCR request."""
+    if interval <= 0:
+        return
+    wait = _last_request_at - time.monotonic()
+    if wait > 0:
+        time.sleep(wait)
+
+
+def _note_pages(page_count, interval):
+    """Charge processed pages against the rate budget (1 page/s by default)."""
+    global _last_request_at
+    if interval <= 0:
+        return
+    try:
+        pages = max(1, int(page_count))
+    except (TypeError, ValueError):
+        pages = 1
+    now = time.monotonic()
+    _last_request_at = max(now, _last_request_at) + pages * interval
+
+
+def _retry_delay(response, interval, attempt):
+    retry_after = response.headers.get("Retry-After") if response.headers else None
+    if retry_after:
+        try:
+            return max(float(retry_after), interval)
+        except (TypeError, ValueError):
+            pass
+    return max(interval, 2.0 ** attempt)
+
+
+def _post_ocr(payload, headers, timeout, interval, verbose=False):
+    """POST the OCR request with throttling and 429/5xx retries."""
+    response = None
+    for attempt in range(1, DEFAULT_MAX_RETRIES + 1):
+        _throttle(interval)
+        response = requests.post(
+            MISTRAL_OCR_URL, headers=headers, json=payload, timeout=timeout
+        )
+        status = getattr(response, "status_code", 200)
+        if status == 429 or status >= 500:
+            if attempt < DEFAULT_MAX_RETRIES:
+                delay = _retry_delay(response, interval, attempt)
+                if verbose:
+                    print("      Mistral rate limit (HTTP %s); retrying in %.0fs (%d/%d)"
+                          % (status, delay, attempt, DEFAULT_MAX_RETRIES - 1))
+                time.sleep(delay)
+                continue
+        response.raise_for_status()
+        return response
+    response.raise_for_status()
 
 
 def _document_payload(path, encoded):
@@ -98,7 +179,8 @@ def _sync_mtime(source_path, output_path):
 
 
 def ocr_file(path, api_key, model=DEFAULT_OCR_MODEL,
-             timeout=DEFAULT_OCR_TIMEOUT, force=False, verbose=False):
+             timeout=DEFAULT_OCR_TIMEOUT, force=False, verbose=False,
+             min_interval=None):
     """OCR one pdf/image into ``<stem>.md`` next to it.
 
     Returns the md path written, or None (unsupported / skipped / failed).
@@ -146,13 +228,12 @@ def ocr_file(path, api_key, model=DEFAULT_OCR_MODEL,
             "document": _document_payload(path, encoded),
         }
 
-        response = requests.post(
-            MISTRAL_OCR_URL, headers=headers, json=payload, timeout=timeout
-        )
-        response.raise_for_status()
+        response = _post_ocr(payload, headers, timeout,
+                             _resolve_interval(min_interval), verbose)
         data = response.json()
 
         pages = data.get("pages") or []
+        _note_pages(len(pages), _resolve_interval(min_interval))
         page_parts = []
         attachment_dir = None
 
@@ -229,7 +310,8 @@ def ocr_file(path, api_key, model=DEFAULT_OCR_MODEL,
 
 
 def ocr_tree(root, api_key, model=DEFAULT_OCR_MODEL,
-             timeout=DEFAULT_OCR_TIMEOUT, force=False, verbose=False):
+             timeout=DEFAULT_OCR_TIMEOUT, force=False, verbose=False,
+             min_interval=None):
     """Walk root and OCR every OCR_EXTENSIONS file without a sibling ``.md``.
 
     Returns the list of md paths written. Never raises.
@@ -251,7 +333,8 @@ def ocr_tree(root, api_key, model=DEFAULT_OCR_MODEL,
             if os.path.exists(_md_path_for(path)) and not force:
                 continue
             result = ocr_file(path, api_key, model=model, timeout=timeout,
-                              force=force, verbose=verbose)
+                              force=force, verbose=verbose,
+                              min_interval=min_interval)
             if result:
                 written.append(result)
     return written
