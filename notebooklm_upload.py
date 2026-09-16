@@ -367,7 +367,8 @@ def collect_candidates(course_dir):
             path = os.path.join(dirpath, filename)
             ext = os.path.splitext(filename)[1].lower()
 
-            # The JSON export is data, not a NotebookLM source.
+            # JSON is either an export this tool generated (<course>.json) or a
+            # data file NotebookLM cannot ingest; never upload either.
             if ext == ".json":
                 continue
 

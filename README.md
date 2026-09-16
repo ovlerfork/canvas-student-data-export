@@ -257,7 +257,7 @@ Upload rules:
 - Files outside that list are uploaded as their converted Markdown sibling (`<name>.md`) instead. A file is never uploaded twice – either the original or the Markdown, never both.
 - Files are deduplicated by SHA-256 across runs, per notebook (see `.notebooklm_state.json` in the output directory); re-running the exporter only uploads new content.
 - NotebookLM flattens folders, so the upload title is the path relative to the course (`course files - Chapter 1 - slides.pdf`), with a numeric suffix if two files would otherwise collide.
-- Generated HTML/Markdown pages, JSON exports, extracted `attachments/` and empty/no-information files are never uploaded, keeping the notebook focused on real course content.
+- Generated HTML pages and their `.md` conversions, JSON files (our `<course>.json` exports as well as any downloaded `.json` data files), extracted `attachments/` and empty/no-information files are never uploaded, keeping the notebook focused on real course content.
 - Each notebook is capped at `NOTEBOOKLM_MAX_SOURCES` (default 300) sources, counting what is already there; extra files are reported and skipped.
 
 # Contribute
