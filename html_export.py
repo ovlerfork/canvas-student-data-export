@@ -22,6 +22,10 @@ ENTRIES_PER_PAGE = 50
 # conversion, NotebookLM uploads) can recognise files written by this exporter.
 GENERATOR_META = '<meta name="generator" content="canvas-student-data-export">'
 
+# All announcements are bundled into this one file, which is replaced only
+# when its content actually changes.
+COMBINED_ANNOUNCEMENTS_NAME = "announcements.md"
+
 STYLESHEET = """
 :root { color-scheme: light dark; }
 body { font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
@@ -368,6 +372,68 @@ def export_course_list_html(course_views, output_dir):
 
     _write(index_path, "Canvas Data Export", "".join(sections) or "<p><em>No courses.</em></p>")
     return 1
+
+
+def _combined_announcements_markdown(course_view):
+    """Render every announcement into a single Markdown document."""
+    announcements = course_view.announcements
+    if not announcements:
+        return ""
+    title = f"{course_view.course_code} - {course_view.name}".strip(" -")
+    parts = [f"# Announcements - {title}" if title else "# Announcements"]
+    for announcement in sorted(announcements, key=lambda a: a.posted_date or ""):
+        parts.append(f"## {announcement.title}")
+        meta = " · ".join(v for v in (announcement.author, announcement.posted_date) if v)
+        if meta:
+            parts.append(meta)
+        if _has_text(announcement.body):
+            parts.append(str(announcement.body))
+        for entry in announcement.topic_entries:
+            entry_meta = " · ".join(v for v in (entry.author, entry.posted_date) if v)
+            if entry_meta:
+                parts.append(entry_meta)
+            if _has_text(entry.body):
+                parts.append(str(entry.body))
+            for reply in entry.topic_replies:
+                reply_meta = " · ".join(v for v in (reply.author, reply.posted_date) if v)
+                reply_body = str(reply.body) if _has_text(reply.body) else ""
+                quoted = "\n".join(
+                    "> " + line for line in (reply_meta + "\n" + reply_body).splitlines()
+                )
+                parts.append(quoted)
+    return "\n\n".join(parts).strip() + "\n"
+
+
+def export_combined_announcements(course_view, output_dir):
+    """Write all announcements into one Markdown file, only when it changed.
+
+    The previous version is replaced in place; an unchanged file keeps its
+    mtime, so the course does not look freshly active and the notebook source
+    is not re-uploaded. Returns the path when (re)written, else None.
+    """
+    body = _combined_announcements_markdown(course_view)
+    if not body:
+        return None
+    path = os.path.join(_course_dir(output_dir, course_view), COMBINED_ANNOUNCEMENTS_NAME)
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            if handle.read() == body:
+                return None
+    except OSError:
+        pass
+    tmp_path = path + ".tmp"
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(tmp_path, "w", encoding="utf-8") as handle:
+            handle.write(body)
+        os.replace(tmp_path, path)
+    except OSError:
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+        return None
+    return path
 
 
 def _section_links(course_dir, home_path, course_view):

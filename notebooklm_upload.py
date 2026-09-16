@@ -42,6 +42,17 @@ DEFAULT_MAX_SOURCES = 300
 DEFAULT_MAX_AGE_DAYS = 90
 STATE_FILE_NAME = ".notebooklm_state.json"
 
+# Study guides are generated in Simplified Chinese unless configured otherwise.
+DEFAULT_REPORT_LANGUAGE = "zh_Hans"
+_LANGUAGE_ALIASES = {
+    "zh-cn": "zh_Hans",
+    "zh_cn": "zh_Hans",
+    "zh-hans": "zh_Hans",
+    "zh": "zh_Hans",
+    "chinese": "zh_Hans",
+    "simplified chinese": "zh_Hans",
+}
+
 # Extensions whose Markdown sibling is a conversion artefact (pandoc/OCR).
 # A `.md` next to one of these is skipped in favour of its source; a `.md`
 # next to anything else (e.g. `.json`, `.zip`) is a real file and is kept.
@@ -160,11 +171,11 @@ def course_last_modified(course_view, course_dir):
 
     try:
         for dirpath, dirnames, filenames in os.walk(course_dir):
-            # Extracted media (pandoc/OCR) is written now and says nothing
-            # about when the course was last active.
+            # Extracted media (pandoc/OCR) and generated reports are written now
+            # and say nothing about when the course was last active.
             dirnames[:] = [
                 name for name in dirnames
-                if name != "attachments" and not name.startswith(".")
+                if name not in ("attachments", "reports") and not name.startswith(".")
             ]
             for filename in filenames:
                 if filename.startswith("."):
@@ -178,6 +189,11 @@ def course_last_modified(course_view, course_dir):
                 if ext in (".html", ".htm") and _is_generated_html(path):
                     continue
                 if ext == ".md" and _is_generated_markdown(path):
+                    continue
+                # The combined announcements file is derived from Canvas data
+                # (whose dates are considered above), not new activity itself.
+                if (filename == "announcements.md"
+                        and dirpath == course_dir):
                     continue
                 try:
                     mtime = os.path.getmtime(path)
@@ -235,6 +251,12 @@ def _read_text(path):
     return content.lstrip("\ufeff")
 
 
+# Files that replace their previous source instead of accumulating: the
+# combined announcements file is rewritten in place, so the old notebook
+# source must be deleted when a new version is uploaded.
+REPLACEABLE_NAMES = {"announcements.md"}
+
+
 def _is_generated_html(path):
     """True when the file is an HTML page written by html_export.py."""
     mod = _markdown_export()
@@ -245,7 +267,13 @@ def _is_generated_html(path):
             pass
     try:
         head = _read_head(path)
-        return GENERATED_HTML_MARKER in head
+        if GENERATED_HTML_MARKER in head:
+            return True
+        # Older exporter versions wrote the same shell without the meta tag.
+        return ("<main>" in head
+                and "color-scheme: light dark;" in head
+                and "font-family: system-ui, -apple-system, "
+                    '\"Segoe UI\", Roboto, sans-serif' in head)
     except OSError:
         return False
 
@@ -258,64 +286,6 @@ def _is_generated_markdown(path):
         return marker in head
     except OSError:
         return False
-
-
-# Generated page file names, and the paths html_export writes them to.
-_GENERATED_PAGE_STEMS = {
-    "homepage", "grades", "assignment_list", "announcement_list",
-    "discussion_list", "modules_list", "assignment", "submission",
-}
-_GENERATED_PAGE_RE = re.compile(r"^(attempt|announcement|discussion)_\d+$")
-
-
-def _is_generated_page(path, course_dir):
-    """True for a page written by html_export (or its .md conversion).
-
-    Pages produced by older versions of this tool have no generator marker, so
-    the path shape is used instead: generated pages only ever live directly in
-    the course root, in the assignments/announcements/discussions folders, in
-    assignments/*/attempts/, or directly under modules/<module>/ (downloaded
-    module files stay in modules/<module>/files/).
-    """
-    ext = os.path.splitext(path)[1].lower()
-    if ext not in (".html", ".htm", ".md"):
-        return False
-    try:
-        rel = os.path.relpath(path, course_dir)
-    except ValueError:
-        return False
-    if rel.startswith(".."):
-        return False
-    parts = rel.split(os.sep)
-    stem = os.path.splitext(parts[-1])[0]
-
-    if len(parts) == 1:
-        return stem in ("homepage", "grades")
-
-    top = parts[0]
-    if top == "assignments":
-        if len(parts) == 2:
-            return stem == "assignment_list"
-        if len(parts) == 3:
-            return stem in ("assignment", "submission")
-        if len(parts) == 4 and parts[2] == "attempts":
-            return stem.startswith("attempt_")
-    elif top == "announcements":
-        if len(parts) == 2:
-            return stem == "announcement_list"
-        if len(parts) == 3:
-            return stem.startswith("announcement_")
-    elif top == "discussions":
-        if len(parts) == 2:
-            return stem == "discussion_list"
-        if len(parts) == 3:
-            return stem.startswith("discussion_")
-    elif top == "modules":
-        if len(parts) == 2:
-            return stem == "modules_list"
-        if len(parts) == 3:
-            return True
-    return False
 
 
 def _is_generated_source_title(title):
@@ -428,7 +398,7 @@ def collect_candidates(course_dir):
         # Never recurse into extracted media or hidden directories.
         dirnames[:] = sorted(
             name for name in dirnames
-            if name != "attachments" and not name.startswith(".")
+            if name not in ("attachments", "reports") and not name.startswith(".")
         )
 
         for filename in sorted(filenames):
@@ -438,16 +408,14 @@ def collect_candidates(course_dir):
             path = os.path.join(dirpath, filename)
             ext = os.path.splitext(filename)[1].lower()
 
-            # Generated pages (and their .md conversions) are never sources,
-            # including pages written by older versions without the marker.
-            if _is_generated_page(path, course_dir):
-                continue
-
-            # The JSON export is data, not a NotebookLM source.
+            # JSON is either an export this tool generated (<course>.json) or a
+            # data file NotebookLM cannot ingest; never upload either.
             if ext == ".json":
                 continue
 
-            # Skip HTML pages written by this exporter.
+            # Generated pages (and their .md conversions) are never sources:
+            # the generator meta tag or the exporter's unique page shell marks
+            # them, so downloaded files are unaffected.
             if ext in (".html", ".htm") and _is_generated_html(path):
                 continue
 
@@ -509,6 +477,12 @@ def collect_candidates(course_dir):
                 "sha256": digest,
                 "title": _flattened_title(course_dir, source_path, used_titles),
                 "kind": kind,
+                "replace": (
+                    kind == "original"
+                    and os.path.basename(source_path) in REPLACEABLE_NAMES
+                    and os.path.dirname(os.path.abspath(source_path))
+                    == os.path.abspath(course_dir)
+                ),
             })
 
     return candidates
@@ -646,7 +620,7 @@ async def _prune_generated_sources(client, notebook_id, existing, verbose=False)
     return pruned
 
 
-def _markdown_fallback(candidate, course_dir):
+def _markdown_fallback(candidate):
     """A converted .md sibling to upload when the original cannot be processed."""
     if candidate.get("kind") != "original":
         return None
@@ -656,7 +630,7 @@ def _markdown_fallback(candidate, course_dir):
     md_path = os.path.splitext(path)[0] + ".md"
     if not os.path.isfile(md_path):
         return None
-    if _is_generated_page(md_path, course_dir) or _is_generated_markdown(md_path):
+    if _is_generated_markdown(md_path):
         return None
     if not _has_substance(md_path):
         return None
@@ -670,7 +644,40 @@ def _markdown_fallback(candidate, course_dir):
     }
 
 
-async def _upload_course_async(title, course_dir, state_path, max_sources, verbose, stats):
+async def _generate_incremental_report(client, notebook_id, course_dir, source_ids,
+                                       language, stats, verbose=False):
+    """Generate and download a study guide for the sources uploaded this run."""
+    try:
+        resolved = str(language or DEFAULT_REPORT_LANGUAGE).strip() or DEFAULT_REPORT_LANGUAGE
+        resolved = _LANGUAGE_ALIASES.get(resolved.lower(), resolved)
+        status = await client.artifacts.generate_study_guide(
+            notebook_id, source_ids=list(source_ids), language=resolved)
+        final = await client.artifacts.wait_for_completion(
+            notebook_id, status.task_id, timeout=600.0)
+        if getattr(final, "is_failed", False):
+            print("    Note: NotebookLM study guide generation failed: %s"
+                  % (getattr(final, "error", None) or "unknown error"))
+            return
+        reports_dir = os.path.join(course_dir, "reports")
+        try:
+            os.makedirs(reports_dir)
+        except OSError:
+            pass
+        report_name = "study-guide-%s.md" % time.strftime("%Y%m%d-%H%M%S")
+        report_path = os.path.join(reports_dir, report_name)
+        await client.artifacts.download_report(
+            notebook_id, report_path, artifact_id=getattr(final, "task_id", None))
+        stats["report"] = report_path
+        print("    ✓ NotebookLM study guide saved: %s" % report_path)
+    except Exception as e:
+        print("    Note: could not generate the incremental NotebookLM study guide: %s" % e)
+        if verbose:
+            import traceback
+            traceback.print_exc()
+
+
+async def _upload_course_async(title, course_dir, state_path, max_sources, verbose, stats,
+                               report_enabled=True, report_language=None):
     NotebookLMClient = _load_client()
     profile = _notebooklm_profile()
     if profile:
@@ -737,13 +744,37 @@ async def _upload_course_async(title, course_dir, state_path, max_sources, verbo
 
         candidates = sorted(collect_candidates(course_dir), key=lambda c: c["path"])
         uploaded_shas = state["notebooks"].setdefault(title, {})
+        new_source_ids = []
 
         for cand in candidates:
             if cand["sha256"] in uploaded_shas:
                 stats["deduped"] += 1
                 continue
 
-            if cand["title"] in existing_titles:
+            if cand.get("replace"):
+                # The file is rewritten in place: drop the previous version's
+                # notebook source (and its state) before uploading the new one.
+                replaced = 0
+                for source in list(existing):
+                    if (getattr(source, "title", "") or "") != cand["title"]:
+                        continue
+                    source_id = getattr(source, "id", None)
+                    if source_id:
+                        try:
+                            await client.sources.delete(notebook_id, source_id)
+                            replaced += 1
+                        except Exception:
+                            pass
+                    existing.remove(source)
+                if replaced:
+                    existing_titles.discard(cand["title"])
+                    for sha in [key for key, record in uploaded_shas.items()
+                                if isinstance(record, dict)
+                                and record.get("title") == cand["title"]]:
+                        uploaded_shas.pop(sha, None)
+                    stats["replaced"] += replaced
+                    _save_state(state, state_path)
+            elif cand["title"] in existing_titles:
                 stats["skipped"] += 1
                 continue
 
@@ -752,7 +783,11 @@ async def _upload_course_async(title, course_dir, state_path, max_sources, verbo
                 continue
 
             try:
-                await _upload_asset(client, notebook_id, cand["path"], cand["title"], verbose)
+                source = await _upload_asset(client, notebook_id, cand["path"],
+                                             cand["title"], verbose)
+                source_id = getattr(source, "id", None)
+                if source_id:
+                    new_source_ids.append(source_id)
                 stats["uploaded"] += 1
                 uploaded_shas[cand["sha256"]] = {"title": cand["title"]}
                 existing_titles.add(cand["title"])
@@ -760,7 +795,7 @@ async def _upload_course_async(title, course_dir, state_path, max_sources, verbo
                 if verbose:
                     print("      ✓ Uploaded: %s" % cand["title"])
             except Exception as e:
-                fallback = _markdown_fallback(cand, course_dir)
+                fallback = _markdown_fallback(cand)
                 usable = (
                     fallback is not None
                     and fallback["sha256"] not in uploaded_shas
@@ -774,8 +809,11 @@ async def _upload_course_async(title, course_dir, state_path, max_sources, verbo
                         traceback.print_exc()
                     continue
                 try:
-                    await _upload_asset(client, notebook_id, fallback["path"],
-                                        fallback["title"], verbose)
+                    source = await _upload_asset(client, notebook_id, fallback["path"],
+                                                 fallback["title"], verbose)
+                    source_id = getattr(source, "id", None)
+                    if source_id:
+                        new_source_ids.append(source_id)
                     stats["uploaded"] += 1
                     stats["fallback"] += 1
                     uploaded_shas[fallback["sha256"]] = {"title": fallback["title"]}
@@ -796,13 +834,18 @@ async def _upload_course_async(title, course_dir, state_path, max_sources, verbo
                         import traceback
                         traceback.print_exc()
 
+        if new_source_ids and report_enabled:
+            await _generate_incremental_report(
+                client, notebook_id, course_dir, new_source_ids,
+                report_language, stats, verbose)
+
     return stats
 
 
 def upload_course(title, course_dir, last_modified, state_path, *,
                   max_age_days=DEFAULT_MAX_AGE_DAYS,
                   max_sources=DEFAULT_MAX_SOURCES,
-                  verbose=False):
+                  verbose=False, report_enabled=True, report_language=None):
     """Sync entry point called by export.py per course.
 
     Returns None when the course is not recent, auth is not configured, or the
@@ -839,10 +882,15 @@ def upload_course(title, course_dir, last_modified, state_path, *,
         "deduped": 0,
         "fallback": 0,
         "pruned": 0,
+        "replaced": 0,
+        "report": "",
         "error": False,
     }
     try:
-        asyncio.run(_upload_course_async(title, course_dir, state_path, max_sources, verbose, stats))
+        asyncio.run(_upload_course_async(title, course_dir, state_path, max_sources,
+                                         verbose, stats,
+                                         report_enabled=report_enabled,
+                                         report_language=report_language))
     except Exception as e:
         stats["error"] = True
         print("    ERROR: NotebookLM upload failed for '%s': %s" % (title, e))
@@ -863,6 +911,8 @@ def _empty_stats():
         "deduped": 0,
         "fallback": 0,
         "pruned": 0,
+        "replaced": 0,
+        "report": "",
         "error": False,
         "notebooks": 0,
         "skipped_courses": 0,
@@ -872,7 +922,7 @@ def _empty_stats():
 def upload_courses(entries, state_path, *,
                    max_age_days=DEFAULT_MAX_AGE_DAYS,
                    max_sources=DEFAULT_MAX_SOURCES,
-                   verbose=False):
+                   verbose=False, report_enabled=True, report_language=None):
     """Convenience for export.py over a list of course entries.
 
     ``entries`` are dicts with keys "title", "course_dir", "last_modified".
@@ -896,12 +946,14 @@ def upload_courses(entries, state_path, *,
             max_age_days=max_age_days,
             max_sources=max_sources,
             verbose=verbose,
+            report_enabled=report_enabled,
+            report_language=report_language,
         )
         if result is None:
             totals["skipped_courses"] += 1
             continue
         totals["notebooks"] += 1
         for key in ("uploaded", "skipped", "failed", "capped", "deduped",
-                    "fallback", "pruned"):
+                    "fallback", "pruned", "replaced"):
             totals[key] += int(result.get(key, 0))
     return totals

@@ -18,7 +18,8 @@ import yaml
 import markdown_export
 import mistral_ocr
 import notebooklm_upload
-from html_export import export_course_html, export_course_list_html
+from html_export import (export_combined_announcements, export_course_html,
+                         export_course_list_html)
 from naming import MAX_FOLDER_NAME_SIZE, makeValidFilename, makeValidFolderPath, shortenFileName
 
 # Default network timeout (seconds) for Canvas API and file requests.
@@ -98,6 +99,7 @@ class ExtractionStats:
         self.notebooklm_sources_uploaded = 0
         self.notebooklm_fallbacks = 0
         self.notebooklm_pruned = 0
+        self.notebooklm_reports = 0
         self.json_files_created = 0
         self.student_limitation_warnings = 0
         self.error_count = 0
@@ -137,6 +139,8 @@ NotebookLM Uploads:
                 summary_text += f"\n  • {self.notebooklm_fallbacks} uploaded as Markdown fallback"
             if self.notebooklm_pruned:
                 summary_text += f"\n  • {self.notebooklm_pruned} generated-page sources removed"
+            if self.notebooklm_reports:
+                summary_text += f"\n  • {self.notebooklm_reports} incremental study guides generated"
 
         summary_text += f"""
 
@@ -1227,6 +1231,11 @@ if __name__ == "__main__":
         if notebooklm_max_sources <= 0:
             notebooklm_max_sources = 300
         notebooklm_state_path = os.path.join(DL_LOCATION, notebooklm_upload.STATE_FILE_NAME)
+        notebooklm_report_language = str(
+            os.environ.get("CANVAS_NOTEBOOKLM_REPORT_LANGUAGE")
+            or creds.get("NOTEBOOKLM_REPORT_LANGUAGE") or "zh_Hans").strip() or "zh_Hans"
+        notebooklm_report_enabled = os.environ.get(
+            "CANVAS_NOTEBOOKLM_REPORT", "1").strip().lower() in ("1", "true", "yes", "on")
         print(f"NotebookLM upload enabled: courses active within the last "
               f"{notebooklm_months:g} months (max {notebooklm_max_sources} sources per notebook).")
 
@@ -1299,6 +1308,11 @@ if __name__ == "__main__":
                 html_pages_saved_in_course = export_course_html(course_view, DL_LOCATION, USER_ID)
                 extraction_stats.html_pages_generated += html_pages_saved_in_course
 
+            # --- Combined announcements (one file, replaced on change) -------
+            combined_announcements = export_combined_announcements(course_view, DL_LOCATION)
+            if combined_announcements:
+                print(f"  ✓ Announcements updated: {combined_announcements}")
+
             # --- Markdown conversion (HTML/Word/... -> .md) ------------------
             if markdown_effective:
                 converted = markdown_export.convert_tree(course_dir, pandoc=pandoc_path)
@@ -1325,12 +1339,16 @@ if __name__ == "__main__":
                         max_age_days=notebooklm_max_age_days,
                         max_sources=notebooklm_max_sources,
                         verbose=args.verbose,
+                        report_enabled=notebooklm_report_enabled,
+                        report_language=notebooklm_report_language,
                     )
                     if upload_stats and not upload_stats.get("error"):
                         extraction_stats.notebooklm_notebooks += 1
                         extraction_stats.notebooklm_sources_uploaded += upload_stats.get("uploaded", 0)
                         extraction_stats.notebooklm_fallbacks += upload_stats.get("fallback", 0)
                         extraction_stats.notebooklm_pruned += upload_stats.get("pruned", 0)
+                        if upload_stats.get("report"):
+                            extraction_stats.notebooklm_reports += 1
                 else:
                     print("  Note: course is older than the NotebookLM window; skipping upload")
 
