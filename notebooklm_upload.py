@@ -42,6 +42,14 @@ DEFAULT_MAX_SOURCES = 300
 DEFAULT_MAX_AGE_DAYS = 90
 STATE_FILE_NAME = ".notebooklm_state.json"
 
+# Extensions whose Markdown sibling is a conversion artefact (pandoc/OCR).
+# A `.md` next to one of these is skipped in favour of its source; a `.md`
+# next to anything else (e.g. `.json`, `.zip`) is a real file and is kept.
+_CONVERSION_SOURCE_EXTENSIONS = SUPPORTED_EXTENSIONS | {
+    ".html", ".htm", ".doc", ".docx", ".odt", ".epub", ".rtf", ".txt",
+    ".pptx", ".xlsx", ".tex", ".rst", ".org", ".csv",
+}
+
 # Markers shared with the markdown exporter. These are duplicated here so this
 # module keeps working even if markdown_export.py has not been written yet; the
 # real values are preferred from markdown_export when it is importable.
@@ -107,14 +115,18 @@ def _parse_date_to_epoch(value):
 
 
 def notebooklm_enabled(auth_json=None):
-    """True when NOTEBOOKLM_AUTH_JSON is a non-empty value.
+    """True when NOTEBOOKLM_AUTH_JSON or NOTEBOOKLM_PROFILE is configured.
 
-    An empty string means disabled. This deliberately does not check whether
-    the ``notebooklm`` package is importable (callers print a hint then).
+    ``NOTEBOOKLM_AUTH_JSON`` is inline storage-state JSON (CI friendly);
+    ``NOTEBOOKLM_PROFILE`` selects a profile directory on disk. Either one is
+    enough for the notebooklm package to authenticate without a browser.
     """
     if auth_json is None:
         auth_json = os.environ.get("NOTEBOOKLM_AUTH_JSON", "")
-    return bool(auth_json) and bool(str(auth_json).strip())
+    if auth_json and str(auth_json).strip():
+        return True
+    profile = os.environ.get("NOTEBOOKLM_PROFILE", "")
+    return bool(profile and str(profile).strip())
 
 
 def course_last_modified(course_view, course_dir):
@@ -183,7 +195,8 @@ def is_recent(last_modified, max_age_days=DEFAULT_MAX_AGE_DAYS, now=None):
     """True when ``last_modified`` is within ``max_age_days`` of ``now``.
 
     ``now`` defaults to ``time.time()``. A ``last_modified`` of 0 or less means
-    "no activity known" and returns False.
+    "no activity known" and returns False. Timestamps in the future (e.g. a
+    Canvas due date of a course that is currently running) count as recent.
     """
     if last_modified is None:
         return False
@@ -200,9 +213,19 @@ def is_recent(last_modified, max_age_days=DEFAULT_MAX_AGE_DAYS, now=None):
         age_seconds = float(now) - last
     except (TypeError, ValueError):
         return False
-    if age_seconds < 0:
-        return False
     return age_seconds <= max_days * 86400.0
+
+
+# Extensions whose content is inspected for substance. Everything else
+# (binary media, archives, ...) only needs to be non-empty; reading a large
+# video into memory just to look for text would be wasteful.
+_TEXT_SUBSTANCE_EXTENSIONS = {".md", ".txt", ".html", ".htm", ".csv", ".rst", ".org", ".tex"}
+
+
+def _read_head(path, size=64 * 1024):
+    """Read at most ``size`` characters from the start of a text file."""
+    with open(path, "r", encoding="utf-8", errors="replace") as handle:
+        return handle.read(size)
 
 
 def _read_text(path):
@@ -221,7 +244,7 @@ def _is_generated_html(path):
         except Exception:
             pass
     try:
-        head = _read_text(path)[:64 * 1024]
+        head = _read_head(path)
         return GENERATED_HTML_MARKER in head
     except OSError:
         return False
@@ -231,7 +254,7 @@ def _is_generated_markdown(path):
     """True when the first bytes of a markdown file carry the exporter marker."""
     marker = _md_marker()
     try:
-        head = _read_text(path)[:len(marker) + 64]
+        head = _read_head(path, len(marker) + 64)
         return marker in head
     except OSError:
         return False
@@ -249,13 +272,23 @@ def _html_text(content):
 
 
 def _has_substance(path):
-    """True when a text file carries more than boilerplate.
+    """True when a file carries more than boilerplate.
 
-    ``.md``/``.txt``/``.html``/``.htm`` whose stripped content is empty (or only
-    the generated-markdown marker) are treated as empty, as is an HTML document
-    whose body has no visible text.
+    Text formats (``.md``/``.txt``/``.html``/``.htm``/...) whose stripped
+    content is empty (or only the generated-markdown marker) are treated as
+    empty, as is an HTML document whose body has no visible text. Binary
+    formats only need to be non-empty; their bytes are never read here.
     """
     ext = os.path.splitext(path)[1].lower()
+    try:
+        if os.path.getsize(path) == 0:
+            return False
+    except OSError:
+        return False
+
+    if ext not in _TEXT_SUBSTANCE_EXTENSIONS:
+        return True
+
     try:
         content = _read_text(path)
     except OSError:
@@ -353,14 +386,17 @@ def collect_candidates(course_dir):
                 if os.path.isfile(sibling_html) and _is_generated_html(sibling_html):
                     continue
 
-            # A markdown file with any other sibling of the same stem is a
+            # A markdown file with a convertible sibling of the same stem is a
             # conversion artefact (pandoc/OCR): the sibling is what gets
             # uploaded -- as the original when its type is supported, or as
-            # this .md when it is not. Never upload both.
+            # this .md when it is not. Never upload both. A .md next to a
+            # non-source file (json, zip, ...) is a real file and is kept.
             if ext == ".md":
                 stem = os.path.splitext(filename)[0]
                 if any(
-                    other != filename and os.path.splitext(other)[0] == stem
+                    other != filename
+                    and os.path.splitext(other)[0] == stem
+                    and os.path.splitext(other)[1].lower() in _CONVERSION_SOURCE_EXTENSIONS
                     for other in filenames
                 ):
                     continue
@@ -421,15 +457,43 @@ def _notebooklm_profile():
     return value.strip() or None
 
 
+def _new_state():
+    return {"version": 2, "notebooks": {}, "notebook_ids": {}}
+
+
 def _load_state(state_path):
+    """Load the upload state, migrating the legacy flat format if needed.
+
+    Current format: ``{"version": 2, "notebooks": {<title>: {<sha256>:
+    {"title": ...}}}}``. The legacy format was ``{"<sha256>": {"notebook":
+    <title>, "title": ...}}``, which could only record one notebook per hash
+    and therefore re-uploaded files shared between courses on every run.
+    """
     if not os.path.isfile(state_path):
-        return {}
+        return _new_state()
     try:
         with open(state_path, "r", encoding="utf-8") as handle:
             data = json.load(handle)
-        return data if isinstance(data, dict) else {}
     except Exception:
-        return {}
+        return _new_state()
+    if not isinstance(data, dict):
+        return _new_state()
+    if isinstance(data.get("notebooks"), dict):
+        notebook_ids = data.get("notebook_ids")
+        return {
+            "version": 2,
+            "notebooks": data["notebooks"],
+            "notebook_ids": notebook_ids if isinstance(notebook_ids, dict) else {},
+        }
+
+    migrated = _new_state()
+    for sha, record in data.items():
+        if isinstance(record, dict) and record.get("notebook"):
+            notebook = str(record["notebook"])
+            migrated["notebooks"].setdefault(notebook, {})[sha] = {
+                "title": record.get("title", "")
+            }
+    return migrated
 
 
 def _save_state(state, state_path):
@@ -464,12 +528,24 @@ async def _upload_course_async(title, course_dir, state_path, max_sources, verbo
         client_context = NotebookLMClient.from_storage()
 
     async with client_context as client:
-        # Reuse a notebook with the same title, otherwise create one.
+        state = _load_state(state_path)
+        notebook_ids = state.setdefault("notebook_ids", {})
+
+        # Reuse a notebook with the same title (by cached id first, so reuse
+        # does not depend on NotebookLM's "recently viewed" ordering), or
+        # create one.
         notebook = None
-        for candidate in await client.notebooks.list():
-            if str(getattr(candidate, "title", "") or "") == title:
-                notebook = candidate
-                break
+        cached_id = notebook_ids.get(title)
+        if cached_id:
+            try:
+                notebook = await client.notebooks.get(cached_id)
+            except Exception:
+                notebook = None
+        if notebook is None:
+            for candidate in await client.notebooks.list():
+                if str(getattr(candidate, "title", "") or "") == title:
+                    notebook = candidate
+                    break
         created = False
         if notebook is None:
             notebook = await client.notebooks.create(title)
@@ -478,6 +554,9 @@ async def _upload_course_async(title, course_dir, state_path, max_sources, verbo
         notebook_id = getattr(notebook, "id", None)
         if not notebook_id:
             raise RuntimeError("NotebookLM returned a notebook without an id")
+        if notebook_ids.get(title) != notebook_id:
+            notebook_ids[title] = notebook_id
+            _save_state(state, state_path)
 
         stats["notebook"] = title
         stats["created"] = bool(created)
@@ -499,11 +578,10 @@ async def _upload_course_async(title, course_dir, state_path, max_sources, verbo
             return stats
 
         candidates = sorted(collect_candidates(course_dir), key=lambda c: c["path"])
-        state = _load_state(state_path)
+        uploaded_shas = state["notebooks"].setdefault(title, {})
 
         for cand in candidates:
-            recorded = state.get(cand["sha256"])
-            if isinstance(recorded, dict) and recorded.get("notebook") == title:
+            if cand["sha256"] in uploaded_shas:
                 stats["deduped"] += 1
                 continue
 
@@ -520,7 +598,7 @@ async def _upload_course_async(title, course_dir, state_path, max_sources, verbo
                     notebook_id, cand["path"], title=cand["title"], wait=False
                 )
                 stats["uploaded"] += 1
-                state[cand["sha256"]] = {"notebook": title, "title": cand["title"]}
+                uploaded_shas[cand["sha256"]] = {"title": cand["title"]}
                 existing_titles.add(cand["title"])
                 _save_state(state, state_path)
                 if verbose:
@@ -556,7 +634,8 @@ def upload_course(title, course_dir, last_modified, state_path, *,
         return None
 
     if not notebooklm_enabled():
-        print("    Note: NOTEBOOKLM_AUTH_JSON is not set; skipping NotebookLM upload.")
+        print("    Note: NotebookLM is not configured (set NOTEBOOKLM_AUTH_JSON or "
+              "NOTEBOOKLM_PROFILE); skipping NotebookLM upload.")
         return None
 
     if not _notebooklm_available():
@@ -572,10 +651,12 @@ def upload_course(title, course_dir, last_modified, state_path, *,
         "failed": 0,
         "capped": 0,
         "deduped": 0,
+        "error": False,
     }
     try:
         asyncio.run(_upload_course_async(title, course_dir, state_path, max_sources, verbose, stats))
     except Exception as e:
+        stats["error"] = True
         print("    ERROR: NotebookLM upload failed for '%s': %s" % (title, e))
         if verbose:
             import traceback
@@ -592,6 +673,7 @@ def _empty_stats():
         "failed": 0,
         "capped": 0,
         "deduped": 0,
+        "error": False,
         "notebooks": 0,
         "skipped_courses": 0,
     }
@@ -608,7 +690,8 @@ def upload_courses(entries, state_path, *,
     and "skipped_courses". Returns empty stats when auth is not configured.
     """
     if not notebooklm_enabled():
-        print("    Note: NOTEBOOKLM_AUTH_JSON is not set; skipping NotebookLM upload.")
+        print("    Note: NotebookLM is not configured (set NOTEBOOKLM_AUTH_JSON or "
+              "NOTEBOOKLM_PROFILE); skipping NotebookLM upload.")
         return _empty_stats()
 
     totals = _empty_stats()

@@ -67,12 +67,47 @@ def _rel_link(from_path, to_path):
 
 def _folder_name(value):
     """Sanitize a Canvas title the same way the file/folder exporters do."""
-    name = makeValidFilename(str(value)) if value else "untitled"
+    name = makeValidFilename(str(value)) if value else ""
+    name = name or "untitled"
     return shortenFileName(name, len(name) - MAX_FOLDER_NAME_SIZE)
 
 
 def _safe_name(value):
-    return makeValidFilename(str(value)) if value else "untitled"
+    name = makeValidFilename(str(value)) if value else ""
+    return name or "untitled"
+
+
+def _unique_path(path, used_paths):
+    """Return a path not present in ``used_paths`` (adds " (2)", " (3)", ...).
+
+    Distinct Canvas titles can sanitize to the same filename; without this the
+    second page would silently overwrite the first one.
+    """
+    if path not in used_paths:
+        used_paths.add(path)
+        return path
+    root, ext = os.path.splitext(path)
+    counter = 2
+    while True:
+        candidate = f"{root} ({counter}){ext}"
+        if candidate not in used_paths:
+            used_paths.add(candidate)
+            return candidate
+        counter += 1
+
+
+def _unique_folder(path, used_folders):
+    """Like ``_unique_path`` but for page folders (adds " (2)", ...)."""
+    if path not in used_folders:
+        used_folders.add(path)
+        return path
+    counter = 2
+    while True:
+        candidate = f"{path} ({counter})"
+        if candidate not in used_folders:
+            used_folders.add(candidate)
+            return candidate
+        counter += 1
 
 
 def _escape(value):
@@ -89,6 +124,11 @@ def _rich_text_html(value, empty_message):
     if not value or str(value) == "None":
         return f"<p><em>{html.escape(empty_message)}</em></p>"
     return str(value)
+
+
+_MEDIA_TAG_RE = re.compile(
+    r"<\s*(img|video|audio|iframe|svg|embed|object|figure)\b", re.IGNORECASE
+)
 
 
 def _text_content(value):
@@ -110,8 +150,14 @@ def _has_text(value):
 
     Canvas happily returns empty paragraphs, bare metadata and literal "None"
     bodies; pages that would only repeat that boilerplate are not worth saving.
+    Non-text content (images, embedded video) also counts as information: an
+    assignment that is only a diagram should not be skipped.
     """
-    return bool(_text_content(value))
+    if _text_content(value):
+        return True
+    if value is None:
+        return False
+    return bool(_MEDIA_TAG_RE.search(str(value)))
 
 
 def _doc_link(from_path, to_path, label):
@@ -187,7 +233,9 @@ def _submission_has_content(sub_view):
     ):
         return True
     legacy = getattr(sub_view, "submission_comments", "")
-    return bool(legacy) and _has_text(legacy)
+    if not legacy or str(legacy) in ("None", "[]", "{}"):
+        return False
+    return _has_text(legacy)
 
 
 def _submission_html(sub_view, output_dir, page_path, attempt_links=()):
@@ -382,25 +430,37 @@ def export_course_html(course_view, output_dir, user_id):
     title = f"{course_view.course_code} - {course_view.name}".strip(" -")
 
     # Paths used by multiple sections (and by module item pages).
+    used_paths = set()
+    used_folders = set()
     assignment_paths = {}
     assignment_views = {}
     for assignment in course_view.assignments:
-        assignment_paths[assignment.id] = os.path.join(
-            course_dir, "assignments", _folder_name(assignment.title), "assignment.html"
+        folder = _unique_folder(
+            os.path.join(course_dir, "assignments", _folder_name(assignment.title)),
+            used_folders,
         )
+        assignment_paths[assignment.id] = os.path.join(folder, "assignment.html")
         assignment_views[assignment.id] = assignment
 
+    announcement_folders = {}
     announcement_paths = {}
     for announcement in course_view.announcements:
-        announcement_paths[announcement.id] = os.path.join(
-            course_dir, "announcements", _folder_name(announcement.title), "announcement_1.html"
+        folder = _unique_folder(
+            os.path.join(course_dir, "announcements", _folder_name(announcement.title)),
+            used_folders,
         )
+        announcement_folders[announcement.id] = folder
+        announcement_paths[announcement.id] = os.path.join(folder, "announcement_1.html")
 
+    discussion_folders = {}
     discussion_paths = {}
     for discussion in course_view.discussions:
-        discussion_paths[discussion.id] = os.path.join(
-            course_dir, "discussions", _folder_name(discussion.title), "discussion_1.html"
+        folder = _unique_folder(
+            os.path.join(course_dir, "discussions", _folder_name(discussion.title)),
+            used_folders,
         )
+        discussion_folders[discussion.id] = folder
+        discussion_paths[discussion.id] = os.path.join(folder, "discussion_1.html")
 
     page_views = {page.id: page for page in course_view.pages}
 
@@ -528,7 +588,7 @@ def export_course_html(course_view, output_dir, user_id):
     for announcement in course_view.announcements:
         if announcement.id not in announcement_page_paths:
             continue
-        folder = os.path.join(course_dir, "announcements", _folder_name(announcement.title))
+        folder = announcement_folders[announcement.id]
         header = _meta_line(announcement.author, announcement.posted_date)
         header += _rich_text_html(announcement.body, "No content.")
         count += _write_entry_pages(
@@ -562,7 +622,7 @@ def export_course_html(course_view, output_dir, user_id):
     for discussion in course_view.discussions:
         if discussion.id not in discussion_page_paths:
             continue
-        folder = os.path.join(course_dir, "discussions", _folder_name(discussion.title))
+        folder = discussion_folders[discussion.id]
         header = _meta_line(discussion.author, discussion.posted_date)
         header += _rich_text_html(discussion.body, "No content.")
         count += _write_entry_pages(
@@ -585,14 +645,23 @@ def export_course_html(course_view, output_dir, user_id):
             "discussion_paths": discussion_page_paths,
         }
         sections = []
+        module_item_paths = {}
         for module in course_view.modules:
             module_folder = os.path.join(modules_dir, _folder_name(module.name))
+            for item in module.items:
+                if item.content_type == "SubHeader":
+                    continue
+                module_item_paths[id(item)] = _unique_path(
+                    os.path.join(module_folder, _safe_name(item.title) + ".html"),
+                    used_paths,
+                )
+        for module in course_view.modules:
             items = []
             for item in module.items:
                 if item.content_type == "SubHeader":
                     items.append(f"<li><strong>{_escape(item.title)}</strong></li>")
                     continue
-                item_path = os.path.join(module_folder, _safe_name(item.title) + ".html")
+                item_path = module_item_paths[id(item)]
                 meta = f' <span class="meta">({_escape(item.content_type or "link")})</span>'
                 if _module_item_has_page(item, context):
                     items.append(
@@ -615,11 +684,10 @@ def export_course_html(course_view, output_dir, user_id):
         count += 1
 
         for module in course_view.modules:
-            module_folder = os.path.join(modules_dir, _folder_name(module.name))
             for item in module.items:
                 if not _module_item_has_page(item, context):
                     continue
-                item_path = os.path.join(module_folder, _safe_name(item.title) + ".html")
+                item_path = module_item_paths[id(item)]
                 _write(
                     item_path,
                     item.title,

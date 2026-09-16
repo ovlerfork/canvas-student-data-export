@@ -84,6 +84,19 @@ def _attachment_dir_for(path, stem):
     return os.path.join(os.path.dirname(path), "attachments", stem)
 
 
+def _sync_mtime(source_path, output_path):
+    """Give the generated Markdown the source file's modification time.
+
+    Course recency (NotebookLM) is derived from file mtimes, so an OCR result
+    must not look newer than the document it came from.
+    """
+    try:
+        mtime = os.path.getmtime(source_path)
+        os.utime(output_path, (mtime, mtime))
+    except OSError:
+        pass
+
+
 def ocr_file(path, api_key, model=DEFAULT_OCR_MODEL,
              timeout=DEFAULT_OCR_TIMEOUT, force=False, verbose=False):
     """OCR one pdf/image into ``<stem>.md`` next to it.
@@ -146,9 +159,14 @@ def ocr_file(path, api_key, model=DEFAULT_OCR_MODEL,
         for page in pages:
             page_md = page.get("markdown") or ""
             for img in page.get("images") or []:
-                img_id = img.get("id")
+                raw_id = img.get("id")
                 img_b64 = img.get("image_base64")
-                if not img_id or not img_b64:
+                if not raw_id or not img_b64:
+                    continue
+
+                # Never let an API-provided id escape the attachments directory.
+                img_id = os.path.basename(str(raw_id)).strip()
+                if not img_id or img_id in (".", ".."):
                     continue
 
                 try:
@@ -175,7 +193,7 @@ def ocr_file(path, api_key, model=DEFAULT_OCR_MODEL,
                 # Rewrite only the exact ``(<id>)`` reference, using POSIX
                 # separators in the Markdown.
                 rel = "attachments/" + stem + "/" + img_id
-                page_md = page_md.replace("(" + img_id + ")", "(" + rel + ")")
+                page_md = page_md.replace("(" + str(raw_id) + ")", "(" + rel + ")")
 
             if page_md.strip():
                 page_parts.append("<!-- page %d -->\n\n%s" % (len(page_parts) + 1, page_md.strip()))
@@ -200,6 +218,7 @@ def ocr_file(path, api_key, model=DEFAULT_OCR_MODEL,
             raise
 
         print("      ✓ OCR saved: %s" % md_path)
+        _sync_mtime(path, md_path)
         return md_path
     except Exception as e:
         print("    ERROR: OCR failed for %s: %s" % (path, e))

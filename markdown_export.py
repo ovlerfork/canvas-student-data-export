@@ -115,7 +115,11 @@ def find_pandoc() -> Optional[str]:
     """Return path to a pandoc executable, or None. Checks PANDOC env var, then PATH."""
     from_env = os.environ.get("PANDOC")
     if from_env:
-        return from_env
+        candidate = shutil.which(from_env)
+        if not candidate and os.path.isfile(from_env):
+            candidate = from_env
+        if candidate:
+            return candidate
     return shutil.which("pandoc")
 
 
@@ -376,7 +380,12 @@ def convert_tree(root: str, pandoc: Optional[str] = None, force: bool = False) -
             return written
 
         for dirpath, dirnames, filenames in os.walk(root):
-            dirnames.sort()
+            # Extracted media belongs to its parent document and hidden
+            # directories are not part of the export; do not convert either.
+            dirnames[:] = sorted(
+                name for name in dirnames
+                if name != "attachments" and not name.startswith(".")
+            )
             for name in sorted(filenames):
                 ext = os.path.splitext(name)[1].lower()
                 if ext not in PANDOC_EXTENSIONS:

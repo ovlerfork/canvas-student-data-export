@@ -185,6 +185,11 @@ DL_LOCATION = "./output"
 # List of Course IDs that should be skipped
 COURSES_TO_SKIP = []
 
+# Timeout (seconds) for direct requests.get downloads (submission attachments).
+# canvasapi's own session is patched by _install_default_http_timeout(); this
+# global covers the remaining direct request.
+DOWNLOAD_TIMEOUT = DEFAULT_HTTP_TIMEOUT
+
 DATE_TEMPLATE = "%B %d, %Y %I:%M %p"
 
 # Max PATH length is 260 characters on Windows. See naming.py for the shared
@@ -285,6 +290,8 @@ class attachmentView():
     filename = ""
     url = ""
     local_path = ""
+    updated_at = None
+    created_at = None
 
 class assignmentView():
     id = 0
@@ -524,7 +531,8 @@ def download_submission_attachments(course, course_view):
                 print(f"    Downloading attachment: {attachment.filename}...")
                 if not os.path.exists(filepath):
                     try:
-                        r = requests.get(attachment.url, allow_redirects=True)
+                        r = requests.get(attachment.url, allow_redirects=True,
+                                         timeout=DOWNLOAD_TIMEOUT)
                         r.raise_for_status()
                         with open(filepath, 'wb') as f:
                             f.write(r.content)
@@ -801,6 +809,10 @@ def findCourseAssignments(course):
                             attach_view.url = attachment.url
                             attach_view.id = attachment.id
                             attach_view.filename = attachment.filename
+                            # Keep the Canvas timestamp so the downloaded file
+                            # can inherit it (course recency detection).
+                            attach_view.updated_at = getattr(attachment, "updated_at", None)
+                            attach_view.created_at = getattr(attachment, "created_at", None)
                             sub_view.attachments.append(attach_view)
                         assignment_view.submissions.append(sub_view)
                         extraction_stats.submissions_found += 1
@@ -1102,9 +1114,10 @@ def _preserve_mtime(path, canvas_object):
         try:
             timestamp = dateutil.parser.parse(value).timestamp()
             os.utime(path, (timestamp, timestamp))
+            return
         except (ValueError, TypeError, OverflowError, OSError):
-            pass
-        return
+            # Try the next timestamp field instead of giving up.
+            continue
 
 
 if __name__ == "__main__":
@@ -1166,6 +1179,9 @@ if __name__ == "__main__":
     if args.verbose:
         print(f"HTTP timeout: {http_timeout:g}s")
 
+    # Direct (non-canvasapi) downloads use the same timeout.
+    DOWNLOAD_TIMEOUT = http_timeout
+
     # Markdown conversion: a single pandoc pipeline handles HTML/Word/PPTX/
     # EPUB/... including the pages written by this tool.
     markdown_enabled = not args.no_markdown
@@ -1175,12 +1191,12 @@ if __name__ == "__main__":
         print("Note: pandoc was not found; Markdown conversion is skipped. Install the "
               "full pandoc build (the Docker 'full' image bundles it).")
 
-    # Mistral OCR: only active when an API key is configured (config file wins
-    # over the environment so credentials can live in one place).
+    # Mistral OCR: only active when an API key is configured. As with the
+    # Canvas settings, environment variables take precedence over the file.
     mistral_api_key = ""
     if not args.no_ocr:
-        mistral_api_key = str(creds.get("MISTRAL_API_KEY")
-                              or os.environ.get("MISTRAL_API_KEY", "")).strip()
+        mistral_api_key = str(os.environ.get("MISTRAL_API_KEY")
+                              or creds.get("MISTRAL_API_KEY") or "").strip()
     if mistral_api_key:
         print("Mistral OCR enabled: images and PDFs will be converted to Markdown.")
 
@@ -1190,16 +1206,16 @@ if __name__ == "__main__":
     )
     if notebooklm_upload_enabled:
         try:
-            notebooklm_months = float(creds.get("NOTEBOOKLM_MONTHS")
-                                      or os.environ.get("CANVAS_NOTEBOOKLM_MONTHS") or 3)
+            notebooklm_months = float(os.environ.get("CANVAS_NOTEBOOKLM_MONTHS")
+                                      or creds.get("NOTEBOOKLM_MONTHS") or 3)
         except (TypeError, ValueError):
             notebooklm_months = 3.0
         if notebooklm_months <= 0:
             notebooklm_months = 3.0
         notebooklm_max_age_days = int(round(notebooklm_months * 30.44))
         try:
-            notebooklm_max_sources = int(creds.get("NOTEBOOKLM_MAX_SOURCES")
-                                         or os.environ.get("CANVAS_NOTEBOOKLM_MAX_SOURCES") or 300)
+            notebooklm_max_sources = int(os.environ.get("CANVAS_NOTEBOOKLM_MAX_SOURCES")
+                                         or creds.get("NOTEBOOKLM_MAX_SOURCES") or 300)
         except (TypeError, ValueError):
             notebooklm_max_sources = 300
         if notebooklm_max_sources <= 0:
@@ -1304,7 +1320,7 @@ if __name__ == "__main__":
                         max_sources=notebooklm_max_sources,
                         verbose=args.verbose,
                     )
-                    if upload_stats:
+                    if upload_stats and not upload_stats.get("error"):
                         extraction_stats.notebooklm_notebooks += 1
                         extraction_stats.notebooklm_sources_uploaded += upload_stats.get("uploaded", 0)
                 else:
