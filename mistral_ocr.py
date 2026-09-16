@@ -156,6 +156,50 @@ def _resolve_pages_per_request(pages_per_request):
         return DEFAULT_PAGES_PER_REQUEST
 
 
+def _error_detail(exc):
+    """Best-effort human-readable detail from a requests HTTP error."""
+    response = getattr(exc, "response", None)
+    if response is None:
+        return ""
+    try:
+        data = response.json()
+        if isinstance(data, dict):
+            for key in ("message", "detail", "error"):
+                value = data.get(key)
+                if value:
+                    return " ".join(str(value).split())[:300]
+    except Exception:
+        pass
+    text = getattr(response, "text", "") or ""
+    return " ".join(text.split())[:300]
+
+
+def _inline_document(path):
+    """Build the inline data-URI document for a pdf/image, or None."""
+    try:
+        with open(path, "rb") as source:
+            raw = source.read()
+    except OSError:
+        return None
+    encoded = base64.b64encode(raw).decode("ascii")
+    if len(encoded) > MAX_DATA_URI_BYTES:
+        return None
+    return _document_payload(path, encoded)
+
+
+def _pdf_page_count(path):
+    """Number of pages in a PDF, or None when it cannot be determined."""
+    try:
+        from pypdf import PdfReader
+    except Exception:
+        return None
+    try:
+        count = len(PdfReader(path).pages)
+    except Exception:
+        return None
+    return count if count > 0 else None
+
+
 def _upload_ocr_file(path, key, timeout, verbose=False):
     """Upload a PDF once to the Mistral Files API; return its id or None."""
     try:
@@ -324,21 +368,16 @@ def ocr_file(path, api_key, model=DEFAULT_OCR_MODEL,
         if file_id:
             document = {"type": "file", "file_id": file_id}
         else:
-            try:
-                with open(path, "rb") as source:
-                    raw = source.read()
-            except Exception as e:
-                print("    ERROR: could not read %s: %s" % (path, e))
-                return None
-            encoded = base64.b64encode(raw).decode("ascii")
-            if len(encoded) > MAX_DATA_URI_BYTES:
+            document = _inline_document(path)
+            if document is None:
                 print("    Note: %s is larger than Mistral's ~50 MB inline limit; skipping." % path)
                 return None
-            document = _document_payload(path, encoded)
 
+        total_pages = _pdf_page_count(path) if chunked else None
         page_parts = []
         attachment_dir = None
         start = 0
+        tried_inline = False
         while True:
             payload = {
                 "model": model,
@@ -346,12 +385,33 @@ def ocr_file(path, api_key, model=DEFAULT_OCR_MODEL,
                 "include_image_base64": True,
             }
             if chunked:
+                if total_pages is not None and start >= total_pages:
+                    break
                 if chunk_pages == 1:
                     payload["pages"] = str(start)
                 else:
                     payload["pages"] = "%d-%d" % (start, start + chunk_pages - 1)
 
-            response = _post_ocr(payload, headers, timeout, interval, verbose)
+            try:
+                response = _post_ocr(payload, headers, timeout, interval, verbose)
+            except requests.HTTPError as exc:
+                status = getattr(getattr(exc, "response", None), "status_code", None)
+                if chunked and start > 0 and status in (400, 404, 416, 422):
+                    # Asked for pages past the end of the document: keep what
+                    # has been extracted so far.
+                    break
+                if chunked and not tried_inline and status == 422:
+                    # The Files API route rejected this document; retry once
+                    # inline as a single request.
+                    inline = _inline_document(path)
+                    if inline is not None:
+                        tried_inline = True
+                        chunked = False
+                        document = inline
+                        if verbose:
+                            print("      File-based OCR rejected; retrying inline: %s" % path)
+                        continue
+                raise
             data = response.json()
             pages = data.get("pages") or []
             _note_pages(len(pages), interval)
@@ -396,7 +456,9 @@ def ocr_file(path, api_key, model=DEFAULT_OCR_MODEL,
         _sync_mtime(path, md_path)
         return md_path
     except Exception as e:
-        print("    ERROR: OCR failed for %s: %s" % (path, e))
+        detail = _error_detail(e)
+        print("    ERROR: OCR failed for %s: %s%s"
+              % (path, e, (" [%s]" % detail) if detail else ""))
         if verbose:
             import traceback
             traceback.print_exc()

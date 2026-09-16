@@ -4,3 +4,4 @@ jsonpickle
 canvasapi
 python-dateutil
 PyYAML
+pypdf
