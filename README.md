@@ -160,6 +160,12 @@ USER_ID: 123456
 -   **`API_KEY`**: In Canvas, go to `Account` > `Settings`, scroll down to `Approved Integrations`, and click `+ New Access Token`.
 -   **`USER_ID`**: After logging into Canvas, visit `https://<your-canvas-url>/api/v1/users/self`. Your browser will show a JSON response; find the `id` field.
 -   **`COURSES_TO_SKIP`** (Optional): A list of course IDs to exclude from the export. To find a course ID, go to the course's homepage and look at the URL for the number that follows `/courses/`.
+-   **`MISTRAL_API_KEY`** (Optional): Create an API key in the [Mistral console](https://console.mistral.ai/) under `API Keys`.
+-   **`NOTEBOOKLM_AUTH_JSON`** (Optional): Sign in once with the NotebookLM CLI on a machine with a browser (`pipx install "notebooklm-py[browser]"`, then `notebooklm login`) and pass the saved session to the exporter:
+    ```bash
+    export NOTEBOOKLM_AUTH_JSON="$(cat ~/.notebooklm/profiles/default/storage_state.json)"
+    ```
+    This value is a Google session token: keep it private. When the NotebookLM profile directory is available instead (for example mounted into the container), set `NOTEBOOKLM_PROFILE` to its name.
 
 ## Running the Exporter
 
