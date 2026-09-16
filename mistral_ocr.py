@@ -13,7 +13,10 @@ key just to be imported. Error handling is best-effort: ``ocr_file`` and
 Requests are throttled to about one page per second (configurable through the
 ``MISTRAL_OCR_INTERVAL`` environment variable or the ``min_interval``
 argument) and retried with backoff on HTTP 429/5xx, because Mistral rate limits
-the OCR endpoint aggressively.
+the OCR endpoint aggressively. PDFs are uploaded once to the Mistral Files API
+and then requested page range by page range (``MISTRAL_OCR_CHUNK_PAGES``,
+default 1), so the wait happens while the document is being processed instead
+of after one huge request.
 """
 
 import base64
@@ -31,12 +34,17 @@ OCR_EXTENSIONS = {
 }
 
 MISTRAL_OCR_URL = "https://api.mistral.ai/v1/ocr"
+MISTRAL_FILES_URL = "https://api.mistral.ai/v1/files"
 DEFAULT_OCR_MODEL = "mistral-ocr-latest"
 DEFAULT_OCR_TIMEOUT = 120.0
 
-# OCR is rate limited to one page per second by default.
+# OCR is rate limited to one page per second by default; PDFs are uploaded once
+# to the Files API and then requested one page range at a time, so the wait
+# happens during the document instead of after one huge request.
 DEFAULT_MIN_REQUEST_INTERVAL = 1.0
+DEFAULT_PAGES_PER_REQUEST = 1
 DEFAULT_MAX_RETRIES = 5
+MAX_OCR_PAGES = 5000
 
 # Earliest monotonic time at which the next OCR request may start.
 _last_request_at = 0.0
@@ -134,6 +142,98 @@ def _post_ocr(payload, headers, timeout, interval, verbose=False):
     response.raise_for_status()
 
 
+def _resolve_pages_per_request(pages_per_request):
+    """Pages sent per OCR request (argument, MISTRAL_OCR_CHUNK_PAGES or default)."""
+    if pages_per_request is not None:
+        try:
+            return max(1, int(pages_per_request))
+        except (TypeError, ValueError):
+            pass
+    try:
+        return max(1, int(os.environ.get(
+            "MISTRAL_OCR_CHUNK_PAGES", DEFAULT_PAGES_PER_REQUEST)))
+    except (TypeError, ValueError):
+        return DEFAULT_PAGES_PER_REQUEST
+
+
+def _upload_ocr_file(path, key, timeout, verbose=False):
+    """Upload a PDF once to the Mistral Files API; return its id or None."""
+    try:
+        with open(path, "rb") as handle:
+            response = requests.post(
+                MISTRAL_FILES_URL,
+                headers={"Authorization": "Bearer " + key},
+                files={"file": (os.path.basename(path), handle, "application/pdf")},
+                data={"purpose": "ocr"},
+                timeout=timeout,
+            )
+        response.raise_for_status()
+        file_id = response.json().get("id")
+        if file_id:
+            if verbose:
+                print("      Uploaded to the Mistral Files API: %s" % file_id)
+            return file_id
+    except Exception as e:
+        print("    Note: could not upload %s to the Mistral Files API (%s); "
+              "sending it inline instead." % (path, e))
+    return None
+
+
+def _delete_ocr_file(file_id, key, timeout):
+    """Best-effort cleanup of a file uploaded for OCR."""
+    try:
+        requests.delete(MISTRAL_FILES_URL + "/" + str(file_id),
+                        headers={"Authorization": "Bearer " + key},
+                        timeout=timeout)
+    except Exception:
+        pass
+
+
+def _append_page(page, page_parts, path, stem, attachment_dir):
+    """Save a page's images and append its Markdown. Returns the media dir."""
+    page_md = page.get("markdown") or ""
+    for img in page.get("images") or []:
+        raw_id = img.get("id")
+        img_b64 = img.get("image_base64")
+        if not raw_id or not img_b64:
+            continue
+
+        # Never let an API-provided id escape the attachments directory.
+        img_id = os.path.basename(str(raw_id)).strip()
+        if not img_id or img_id in (".", ".."):
+            continue
+
+        try:
+            img_bytes = base64.b64decode(img_b64)
+        except Exception as e:
+            print("    ERROR: could not decode image %s from %s: %s" % (img_id, path, e))
+            continue
+        if not img_bytes:
+            continue
+
+        if attachment_dir is None:
+            attachment_dir = _attachment_dir_for(path, stem)
+        if not os.path.exists(attachment_dir):
+            os.makedirs(attachment_dir)
+
+        img_path = os.path.join(attachment_dir, img_id)
+        try:
+            with open(img_path, "wb") as img_file:
+                img_file.write(img_bytes)
+        except Exception as e:
+            print("    ERROR: could not save image %s for %s: %s" % (img_id, path, e))
+            continue
+
+        # Rewrite only the exact ``(<id>)`` reference, using POSIX
+        # separators in the Markdown.
+        rel = "attachments/" + stem + "/" + img_id
+        page_md = page_md.replace("(" + str(raw_id) + ")", "(" + rel + ")")
+
+    if page_md.strip():
+        page_parts.append("<!-- page %d -->\n\n%s" % (len(page_parts) + 1, page_md.strip()))
+    return attachment_dir
+
+
 def _document_payload(path, encoded):
     """Build the ``document`` object for the OCR request body."""
     ext = os.path.splitext(path)[1].lower()
@@ -180,14 +280,18 @@ def _sync_mtime(source_path, output_path):
 
 def ocr_file(path, api_key, model=DEFAULT_OCR_MODEL,
              timeout=DEFAULT_OCR_TIMEOUT, force=False, verbose=False,
-             min_interval=None):
-    """OCR one pdf/image into ``<stem>.md`` next to it.
+             min_interval=None, pages_per_request=None):
+    """OCR one pdf/image into ``<stem>.md`` next to the source.
 
-    Returns the md path written, or None (unsupported / skipped / failed).
-    Never raises.
+    PDFs are uploaded once to the Mistral Files API and then requested page
+    range by page range, so the one-page-per-second throttle waits during the
+    document instead of after one huge request (and the file is not re-uploaded
+    per chunk). Images are sent inline. Returns the md path written, or None
+    (unsupported / skipped / failed). Never raises.
     """
+    file_id = None
+    key = str(api_key).strip() if api_key else ""
     try:
-        key = str(api_key).strip() if api_key else ""
         if not key:
             print("    Note: No Mistral API key configured; skipping OCR.")
             return None
@@ -207,77 +311,67 @@ def ocr_file(path, api_key, model=DEFAULT_OCR_MODEL,
                 print("      ✓ Already exists: %s" % md_path)
             return None
 
-        try:
-            with open(path, "rb") as source:
-                raw = source.read()
-        except Exception as e:
-            print("    ERROR: could not read %s: %s" % (path, e))
-            return None
-
-        encoded = base64.b64encode(raw).decode("ascii")
-        if len(encoded) > MAX_DATA_URI_BYTES:
-            print("    Note: %s is larger than Mistral's ~50 MB data-URI limit; skipping." % path)
-            return None
-
+        interval = _resolve_interval(min_interval)
+        chunk_pages = _resolve_pages_per_request(pages_per_request)
         headers = {
             "Authorization": "Bearer " + key,
             "Content-Type": "application/json",
         }
-        payload = {
-            "model": model,
-            "document": _document_payload(path, encoded),
-        }
 
-        response = _post_ocr(payload, headers, timeout,
-                             _resolve_interval(min_interval), verbose)
-        data = response.json()
+        if ext == ".pdf":
+            file_id = _upload_ocr_file(path, key, timeout, verbose)
+        chunked = bool(file_id)
+        if file_id:
+            document = {"type": "file", "file_id": file_id}
+        else:
+            try:
+                with open(path, "rb") as source:
+                    raw = source.read()
+            except Exception as e:
+                print("    ERROR: could not read %s: %s" % (path, e))
+                return None
+            encoded = base64.b64encode(raw).decode("ascii")
+            if len(encoded) > MAX_DATA_URI_BYTES:
+                print("    Note: %s is larger than Mistral's ~50 MB inline limit; skipping." % path)
+                return None
+            document = _document_payload(path, encoded)
 
-        pages = data.get("pages") or []
-        _note_pages(len(pages), _resolve_interval(min_interval))
         page_parts = []
         attachment_dir = None
+        start = 0
+        while True:
+            payload = {
+                "model": model,
+                "document": document,
+                "include_image_base64": True,
+            }
+            if chunked:
+                if chunk_pages == 1:
+                    payload["pages"] = str(start)
+                else:
+                    payload["pages"] = "%d-%d" % (start, start + chunk_pages - 1)
 
-        for page in pages:
-            page_md = page.get("markdown") or ""
-            for img in page.get("images") or []:
-                raw_id = img.get("id")
-                img_b64 = img.get("image_base64")
-                if not raw_id or not img_b64:
-                    continue
+            response = _post_ocr(payload, headers, timeout, interval, verbose)
+            data = response.json()
+            pages = data.get("pages") or []
+            _note_pages(len(pages), interval)
 
-                # Never let an API-provided id escape the attachments directory.
-                img_id = os.path.basename(str(raw_id)).strip()
-                if not img_id or img_id in (".", ".."):
-                    continue
+            for page in pages:
+                attachment_dir = _append_page(page, page_parts, path, stem, attachment_dir)
 
+            if not chunked or not pages:
+                break
+            indexes = []
+            for offset, page in enumerate(pages):
                 try:
-                    img_bytes = base64.b64decode(img_b64)
-                except Exception as e:
-                    print("    ERROR: could not decode image %s from %s: %s" % (img_id, path, e))
-                    continue
-                if not img_bytes:
-                    continue
-
-                if attachment_dir is None:
-                    attachment_dir = _attachment_dir_for(path, stem)
-                if not os.path.exists(attachment_dir):
-                    os.makedirs(attachment_dir)
-
-                img_path = os.path.join(attachment_dir, img_id)
-                try:
-                    with open(img_path, "wb") as img_file:
-                        img_file.write(img_bytes)
-                except Exception as e:
-                    print("    ERROR: could not save image %s for %s: %s" % (img_id, path, e))
-                    continue
-
-                # Rewrite only the exact ``(<id>)`` reference, using POSIX
-                # separators in the Markdown.
-                rel = "attachments/" + stem + "/" + img_id
-                page_md = page_md.replace("(" + str(raw_id) + ")", "(" + rel + ")")
-
-            if page_md.strip():
-                page_parts.append("<!-- page %d -->\n\n%s" % (len(page_parts) + 1, page_md.strip()))
+                    indexes.append(int(page.get("index", start + offset)))
+                except (TypeError, ValueError):
+                    indexes.append(start + offset)
+            if len(pages) < chunk_pages or max(indexes) < start:
+                break
+            start = max(indexes) + 1
+            if start >= MAX_OCR_PAGES:
+                break
 
         full_md = "\n\n---\n\n".join(page_parts)
         if not full_md.strip():
@@ -307,11 +401,14 @@ def ocr_file(path, api_key, model=DEFAULT_OCR_MODEL,
             import traceback
             traceback.print_exc()
         return None
+    finally:
+        if file_id:
+            _delete_ocr_file(file_id, key, timeout)
 
 
 def ocr_tree(root, api_key, model=DEFAULT_OCR_MODEL,
              timeout=DEFAULT_OCR_TIMEOUT, force=False, verbose=False,
-             min_interval=None):
+             min_interval=None, pages_per_request=None):
     """Walk root and OCR every OCR_EXTENSIONS file without a sibling ``.md``.
 
     Returns the list of md paths written. Never raises.
@@ -334,7 +431,8 @@ def ocr_tree(root, api_key, model=DEFAULT_OCR_MODEL,
                 continue
             result = ocr_file(path, api_key, model=model, timeout=timeout,
                               force=force, verbose=verbose,
-                              min_interval=min_interval)
+                              min_interval=min_interval,
+                              pages_per_request=pages_per_request)
             if result:
                 written.append(result)
     return written
