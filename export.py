@@ -96,6 +96,8 @@ class ExtractionStats:
         self.ocr_files_created = 0
         self.notebooklm_notebooks = 0
         self.notebooklm_sources_uploaded = 0
+        self.notebooklm_fallbacks = 0
+        self.notebooklm_pruned = 0
         self.json_files_created = 0
         self.student_limitation_warnings = 0
         self.error_count = 0
@@ -131,6 +133,10 @@ Markdown Conversion:
 NotebookLM Uploads:
   • {self.notebooklm_notebooks} notebooks used
   • {self.notebooklm_sources_uploaded} sources uploaded"""
+            if self.notebooklm_fallbacks:
+                summary_text += f"\n  • {self.notebooklm_fallbacks} uploaded as Markdown fallback"
+            if self.notebooklm_pruned:
+                summary_text += f"\n  • {self.notebooklm_pruned} generated-page sources removed"
 
         summary_text += f"""
 
@@ -1323,6 +1329,8 @@ if __name__ == "__main__":
                     if upload_stats and not upload_stats.get("error"):
                         extraction_stats.notebooklm_notebooks += 1
                         extraction_stats.notebooklm_sources_uploaded += upload_stats.get("uploaded", 0)
+                        extraction_stats.notebooklm_fallbacks += upload_stats.get("fallback", 0)
+                        extraction_stats.notebooklm_pruned += upload_stats.get("pruned", 0)
                 else:
                     print("  Note: course is older than the NotebookLM window; skipping upload")
 

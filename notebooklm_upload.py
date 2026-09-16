@@ -260,6 +260,77 @@ def _is_generated_markdown(path):
         return False
 
 
+# Generated page file names, and the paths html_export writes them to.
+_GENERATED_PAGE_STEMS = {
+    "homepage", "grades", "assignment_list", "announcement_list",
+    "discussion_list", "modules_list", "assignment", "submission",
+}
+_GENERATED_PAGE_RE = re.compile(r"^(attempt|announcement|discussion)_\d+$")
+
+
+def _is_generated_page(path, course_dir):
+    """True for a page written by html_export (or its .md conversion).
+
+    Pages produced by older versions of this tool have no generator marker, so
+    the path shape is used instead: generated pages only ever live directly in
+    the course root, in the assignments/announcements/discussions folders, in
+    assignments/*/attempts/, or directly under modules/<module>/ (downloaded
+    module files stay in modules/<module>/files/).
+    """
+    ext = os.path.splitext(path)[1].lower()
+    if ext not in (".html", ".htm", ".md"):
+        return False
+    try:
+        rel = os.path.relpath(path, course_dir)
+    except ValueError:
+        return False
+    if rel.startswith(".."):
+        return False
+    parts = rel.split(os.sep)
+    stem = os.path.splitext(parts[-1])[0]
+
+    if len(parts) == 1:
+        return stem in ("homepage", "grades")
+
+    top = parts[0]
+    if top == "assignments":
+        if len(parts) == 2:
+            return stem == "assignment_list"
+        if len(parts) == 3:
+            return stem in ("assignment", "submission")
+        if len(parts) == 4 and parts[2] == "attempts":
+            return stem.startswith("attempt_")
+    elif top == "announcements":
+        if len(parts) == 2:
+            return stem == "announcement_list"
+        if len(parts) == 3:
+            return stem.startswith("announcement_")
+    elif top == "discussions":
+        if len(parts) == 2:
+            return stem == "discussion_list"
+        if len(parts) == 3:
+            return stem.startswith("discussion_")
+    elif top == "modules":
+        if len(parts) == 2:
+            return stem == "modules_list"
+        if len(parts) == 3:
+            return True
+    return False
+
+
+def _is_generated_source_title(title):
+    """True for the flattened title of a generated page source (for pruning)."""
+    name = str(title).rsplit(" - ", 1)[-1]
+    stem, ext = os.path.splitext(name)
+    if ext.lower() != ".md":
+        return False
+    if stem in ("homepage", "grades", "assignment", "submission",
+                "assignment_list", "announcement_list", "discussion_list",
+                "modules_list"):
+        return True
+    return bool(re.match(r"^(attempt|announcement|discussion)_\d+( \(\d+\))?$", stem))
+
+
 def _html_text(content):
     """Visible text of an HTML document, ignoring scripts/styles/tags."""
     body = content
@@ -367,8 +438,12 @@ def collect_candidates(course_dir):
             path = os.path.join(dirpath, filename)
             ext = os.path.splitext(filename)[1].lower()
 
-            # JSON is either an export this tool generated (<course>.json) or a
-            # data file NotebookLM cannot ingest; never upload either.
+            # Generated pages (and their .md conversions) are never sources,
+            # including pages written by older versions without the marker.
+            if _is_generated_page(path, course_dir):
+                continue
+
+            # The JSON export is data, not a NotebookLM source.
             if ext == ".json":
                 continue
 
@@ -520,6 +595,81 @@ def _save_state(state, state_path):
             pass
 
 
+_MAX_UPLOAD_ATTEMPTS = 3
+_UPLOAD_BACKOFF_SECONDS = 2.0
+
+
+async def _upload_asset(client, notebook_id, path, title, verbose=False):
+    """Upload one file, retrying failures and cleaning up failed rows.
+
+    A failed upload can leave a broken source row behind (which still counts
+    against the notebook quota), so the row is deleted before retrying.
+    """
+    last_error = None
+    for attempt in range(1, _MAX_UPLOAD_ATTEMPTS + 1):
+        try:
+            return await client.sources.add_file(
+                notebook_id, path, title=title, wait=False
+            )
+        except Exception as e:
+            last_error = e
+            source_id = getattr(e, "source_id", None)
+            if source_id:
+                try:
+                    await client.sources.delete(notebook_id, source_id)
+                except Exception:
+                    pass
+            if attempt < _MAX_UPLOAD_ATTEMPTS:
+                if verbose:
+                    print("      Retrying %s (%d/%d): %s"
+                          % (os.path.basename(path), attempt,
+                             _MAX_UPLOAD_ATTEMPTS - 1, e))
+                await asyncio.sleep(_UPLOAD_BACKOFF_SECONDS * attempt)
+    raise last_error
+
+
+async def _prune_generated_sources(client, notebook_id, existing, verbose=False):
+    """Delete generated-page sources uploaded by older versions."""
+    pruned = 0
+    for source in existing:
+        title = getattr(source, "title", "") or ""
+        source_id = getattr(source, "id", None)
+        if not source_id or not _is_generated_source_title(title):
+            continue
+        try:
+            await client.sources.delete(notebook_id, source_id)
+            pruned += 1
+            if verbose:
+                print("      Removed generated page source: %s" % title)
+        except Exception:
+            continue
+    return pruned
+
+
+def _markdown_fallback(candidate, course_dir):
+    """A converted .md sibling to upload when the original cannot be processed."""
+    if candidate.get("kind") != "original":
+        return None
+    path = candidate["path"]
+    if os.path.splitext(path)[1].lower() not in SUPPORTED_EXTENSIONS:
+        return None
+    md_path = os.path.splitext(path)[0] + ".md"
+    if not os.path.isfile(md_path):
+        return None
+    if _is_generated_page(md_path, course_dir) or _is_generated_markdown(md_path):
+        return None
+    if not _has_substance(md_path):
+        return None
+    digest = _sha256(md_path)
+    if not digest:
+        return None
+    return {
+        "path": os.path.abspath(md_path),
+        "sha256": digest,
+        "title": os.path.splitext(candidate["title"])[0] + ".md",
+    }
+
+
 async def _upload_course_async(title, course_dir, state_path, max_sources, verbose, stats):
     NotebookLMClient = _load_client()
     profile = _notebooklm_profile()
@@ -563,6 +713,13 @@ async def _upload_course_async(title, course_dir, state_path, max_sources, verbo
         stats["created"] = bool(created)
 
         existing = await client.sources.list(notebook_id)
+        pruned = await _prune_generated_sources(client, notebook_id, existing, verbose)
+        if pruned:
+            stats["pruned"] += pruned
+            existing = [
+                source for source in existing
+                if not _is_generated_source_title(getattr(source, "title", "") or "")
+            ]
         existing_titles = set()
         for source in existing:
             source_title = getattr(source, "title", None)
@@ -595,9 +752,7 @@ async def _upload_course_async(title, course_dir, state_path, max_sources, verbo
                 continue
 
             try:
-                await client.sources.add_file(
-                    notebook_id, cand["path"], title=cand["title"], wait=False
-                )
+                await _upload_asset(client, notebook_id, cand["path"], cand["title"], verbose)
                 stats["uploaded"] += 1
                 uploaded_shas[cand["sha256"]] = {"title": cand["title"]}
                 existing_titles.add(cand["title"])
@@ -605,11 +760,41 @@ async def _upload_course_async(title, course_dir, state_path, max_sources, verbo
                 if verbose:
                     print("      ✓ Uploaded: %s" % cand["title"])
             except Exception as e:
-                stats["failed"] += 1
-                print("    ERROR: upload failed for %s: %s" % (cand["path"], e))
-                if verbose:
-                    import traceback
-                    traceback.print_exc()
+                fallback = _markdown_fallback(cand, course_dir)
+                usable = (
+                    fallback is not None
+                    and fallback["sha256"] not in uploaded_shas
+                    and fallback["title"] not in existing_titles
+                )
+                if not usable:
+                    stats["failed"] += 1
+                    print("    ERROR: upload failed for %s: %s" % (cand["path"], e))
+                    if verbose:
+                        import traceback
+                        traceback.print_exc()
+                    continue
+                try:
+                    await _upload_asset(client, notebook_id, fallback["path"],
+                                        fallback["title"], verbose)
+                    stats["uploaded"] += 1
+                    stats["fallback"] += 1
+                    uploaded_shas[fallback["sha256"]] = {"title": fallback["title"]}
+                    # Remember the original as handled so it is not retried on
+                    # every run; the Markdown version is what was uploaded.
+                    uploaded_shas[cand["sha256"]] = {
+                        "title": fallback["title"], "fallback": True
+                    }
+                    existing_titles.add(fallback["title"])
+                    _save_state(state, state_path)
+                    print("    Note: %s could not be processed; uploaded its "
+                          "Markdown version instead." % os.path.basename(cand["path"]))
+                except Exception as e2:
+                    stats["failed"] += 1
+                    print("    ERROR: upload failed for %s (and for its Markdown "
+                          "fallback): %s / %s" % (cand["path"], e, e2))
+                    if verbose:
+                        import traceback
+                        traceback.print_exc()
 
     return stats
 
@@ -652,6 +837,8 @@ def upload_course(title, course_dir, last_modified, state_path, *,
         "failed": 0,
         "capped": 0,
         "deduped": 0,
+        "fallback": 0,
+        "pruned": 0,
         "error": False,
     }
     try:
@@ -674,6 +861,8 @@ def _empty_stats():
         "failed": 0,
         "capped": 0,
         "deduped": 0,
+        "fallback": 0,
+        "pruned": 0,
         "error": False,
         "notebooks": 0,
         "skipped_courses": 0,
@@ -712,6 +901,7 @@ def upload_courses(entries, state_path, *,
             totals["skipped_courses"] += 1
             continue
         totals["notebooks"] += 1
-        for key in ("uploaded", "skipped", "failed", "capped", "deduped"):
+        for key in ("uploaded", "skipped", "failed", "capped", "deduped",
+                    "fallback", "pruned"):
             totals[key] += int(result.get(key, 0))
     return totals
