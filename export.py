@@ -5,6 +5,7 @@ import math
 import os
 import argparse
 import sys
+from concurrent.futures import ThreadPoolExecutor
 
 # external
 from canvasapi import Canvas
@@ -156,6 +157,19 @@ Errors Encountered: {self.error_count}
 
 # Global stats tracker
 extraction_stats = ExtractionStats()
+
+
+def _record_notebooklm_uploads(upload_results, stats):
+    """Add completed NotebookLM results to the final export statistics."""
+    for upload_stats in upload_results:
+        if not upload_stats or upload_stats.get("error"):
+            continue
+        stats.notebooklm_notebooks += 1
+        stats.notebooklm_sources_uploaded += upload_stats.get("uploaded", 0)
+        stats.notebooklm_fallbacks += upload_stats.get("fallback", 0)
+        stats.notebooklm_pruned += upload_stats.get("pruned", 0)
+        if upload_stats.get("report"):
+            stats.notebooklm_reports += 1
 
 def _load_credentials(path: str) -> dict:
     """Return a dict with API_URL, API_KEY, USER_ID or empty dict if file missing."""
@@ -1130,7 +1144,9 @@ def _preserve_mtime(path, canvas_object):
             continue
 
 
-if __name__ == "__main__":
+def main():
+    global API_URL, API_KEY, USER_ID, COURSES_TO_SKIP, DL_LOCATION, DOWNLOAD_TIMEOUT
+
 
     print("Welcome to the Canvas Student Data Export Tool\n")
 
@@ -1271,119 +1287,144 @@ if __name__ == "__main__":
         canvas.get_courses(enrollment_state = "completed", include=["term"])
     ]
 
+    notebooklm_executor = None
+    notebooklm_futures = []
+    notebooklm_futures_by_course_dir = {}
+    if notebooklm_upload_enabled:
+        # The state file is read-modify-written by each upload, so NotebookLM
+        # jobs remain serialized while Canvas work proceeds in this thread.
+        notebooklm_executor = ThreadPoolExecutor(max_workers=1,
+                                                  thread_name_prefix="notebooklm")
+
     skip = set(COURSES_TO_SKIP)
 
     if args.html:
         print("HTML export enabled: pages will be generated from Canvas API data\n")
 
-    for courses in courses_list:
-        for course in courses:
-            if course.id in skip or not hasattr(course, "name") or not hasattr(course, "term"):
-                continue
+    try:
+        for courses in courses_list:
+            for course in courses:
+                if course.id in skip or not hasattr(course, "name") or not hasattr(course, "term"):
+                    continue
 
-            course_view = getCourseView(course)
+                course_view = getCourseView(course)
 
-            if args.html:
-                course_view.homepage_html = _fetch_front_page_body(course)
+                if args.html:
+                    course_view.homepage_html = _fetch_front_page_body(course)
 
-            all_courses_views.append(course_view)
+                all_courses_views.append(course_view)
 
-            course_dir = os.path.join(DL_LOCATION, course_view.term,
-                                      course_view.course_code)
+                course_dir = os.path.join(DL_LOCATION, course_view.term,
+                                          course_view.course_code)
 
-            print("  Downloading all files")
-            downloadCourseFiles(course, course_view)
+                previous_upload = notebooklm_futures_by_course_dir.get(course_dir)
+                if previous_upload:
+                    previous_upload.result()
 
-            print("  Downloading submission attachments")
-            download_submission_attachments(course, course_view)
+                print("  Downloading all files")
+                downloadCourseFiles(course, course_view)
 
-            print("  Getting modules and downloading module files")
-            course_view.modules = findCourseModules(course, course_view)
+                print("  Downloading submission attachments")
+                download_submission_attachments(course, course_view)
 
-            print("  Exporting all course data")
-            exportAllCourseData(course_view)
+                print("  Getting modules and downloading module files")
+                course_view.modules = findCourseModules(course, course_view)
 
-            html_pages_saved_in_course = 0
-            if args.html:
-                html_pages_saved_in_course = export_course_html(course_view, DL_LOCATION, USER_ID)
-                extraction_stats.html_pages_generated += html_pages_saved_in_course
+                print("  Exporting all course data")
+                exportAllCourseData(course_view)
 
-            # --- Combined announcements (one file, replaced on change) -------
-            combined_announcements = export_combined_announcements(course_view, DL_LOCATION)
-            if combined_announcements:
-                print(f"  ✓ Announcements updated: {combined_announcements}")
+                html_pages_saved_in_course = 0
+                if args.html:
+                    html_pages_saved_in_course = export_course_html(course_view, DL_LOCATION, USER_ID)
+                    extraction_stats.html_pages_generated += html_pages_saved_in_course
 
-            # --- Markdown conversion (HTML/Word/... -> .md) ------------------
-            if markdown_effective:
-                converted = markdown_export.convert_tree(course_dir, pandoc=pandoc_path)
-                if converted:
-                    extraction_stats.markdown_files_created += len(converted)
-                    print(f"  ✓ Converted {len(converted)} files to Markdown")
+                # --- Combined announcements (one file, replaced on change) -------
+                combined_announcements = export_combined_announcements(course_view, DL_LOCATION)
+                if combined_announcements:
+                    print(f"  ✓ Announcements updated: {combined_announcements}")
 
-            # --- Mistral OCR (images/PDFs -> .md) ---------------------------
-            if mistral_api_key:
-                ocr_written = mistral_ocr.ocr_tree(
-                    course_dir, mistral_api_key, timeout=http_timeout, verbose=args.verbose
-                )
-                if ocr_written:
-                    extraction_stats.ocr_files_created += len(ocr_written)
-                    print(f"  ✓ OCR'd {len(ocr_written)} images/PDFs to Markdown")
+                # --- Markdown conversion (HTML/Word/... -> .md) ------------------
+                if markdown_effective:
+                    converted = markdown_export.convert_tree(course_dir, pandoc=pandoc_path)
+                    if converted:
+                        extraction_stats.markdown_files_created += len(converted)
+                        print(f"  ✓ Converted {len(converted)} files to Markdown")
 
-            # --- NotebookLM upload (recent courses only) --------------------
-            if notebooklm_upload_enabled:
-                last_modified = notebooklm_upload.course_last_modified(course_view, course_dir)
-                if notebooklm_upload.is_recent(last_modified, max_age_days=notebooklm_max_age_days):
-                    notebook_title = f"{course_view.term} - {course_view.course_code} - {course_view.name}".strip(" -")
-                    upload_stats = notebooklm_upload.upload_course(
-                        notebook_title, course_dir, last_modified, notebooklm_state_path,
-                        max_age_days=notebooklm_max_age_days,
-                        max_sources=notebooklm_max_sources,
-                        verbose=args.verbose,
-                        report_enabled=notebooklm_report_enabled,
-                        report_language=notebooklm_report_language,
+                # --- Mistral OCR (images/PDFs -> .md) ---------------------------
+                if mistral_api_key:
+                    ocr_written = mistral_ocr.ocr_tree(
+                        course_dir, mistral_api_key, timeout=http_timeout, verbose=args.verbose
                     )
-                    if upload_stats and not upload_stats.get("error"):
-                        extraction_stats.notebooklm_notebooks += 1
-                        extraction_stats.notebooklm_sources_uploaded += upload_stats.get("uploaded", 0)
-                        extraction_stats.notebooklm_fallbacks += upload_stats.get("fallback", 0)
-                        extraction_stats.notebooklm_pruned += upload_stats.get("pruned", 0)
-                        if upload_stats.get("report"):
-                            extraction_stats.notebooklm_reports += 1
-                else:
-                    print("  Note: course is older than the NotebookLM window; skipping upload")
+                    if ocr_written:
+                        extraction_stats.ocr_files_created += len(ocr_written)
+                        print(f"  ✓ OCR'd {len(ocr_written)} images/PDFs to Markdown")
 
-            # Show mini-summary for this course
-            assignments_count = len(course_view.assignments)
-            submissions_count = sum(len(a.submissions) for a in course_view.assignments)
-            modules_count = len(course_view.modules)
-            pages_count = len(course_view.pages)
-            announcements_count = len(course_view.announcements)
-            discussions_count = len(course_view.discussions)
+                # Show mini-summary for this course
+                assignments_count = len(course_view.assignments)
+                submissions_count = sum(len(a.submissions) for a in course_view.assignments)
+                modules_count = len(course_view.modules)
+                pages_count = len(course_view.pages)
+                announcements_count = len(course_view.announcements)
+                discussions_count = len(course_view.discussions)
 
-            print(f"  ✓ Course data exported:")
-            print(f"    • {assignments_count} assignments with {submissions_count} submissions (JSON)")
-            print(f"    • {modules_count} modules (JSON)")
-            print(f"    • {pages_count} pages (JSON)")
-            print(f"    • {announcements_count} announcements (JSON)")
-            print(f"    • {discussions_count} discussions (JSON)")
-            if args.html:
-                print(f"    • {html_pages_saved_in_course} HTML pages generated")
-            print()
+                print(f"  ✓ Course data exported:")
+                print(f"    • {assignments_count} assignments with {submissions_count} submissions (JSON)")
+                print(f"    • {modules_count} modules (JSON)")
+                print(f"    • {pages_count} pages (JSON)")
+                print(f"    • {announcements_count} announcements (JSON)")
+                print(f"    • {discussions_count} discussions (JSON)")
+                if args.html:
+                    print(f"    • {html_pages_saved_in_course} HTML pages generated")
+                print()
 
-    if args.html:
-        extraction_stats.html_pages_generated += export_course_list_html(all_courses_views, DL_LOCATION)
+                # --- NotebookLM upload (recent courses only) --------------------
+                if notebooklm_upload_enabled:
+                    last_modified = notebooklm_upload.course_last_modified(course_view, course_dir)
+                    if notebooklm_upload.is_recent(last_modified, max_age_days=notebooklm_max_age_days):
+                        notebook_title = f"{course_view.term} - {course_view.course_code} - {course_view.name}".strip(" -")
+                        upload_future = notebooklm_executor.submit(
+                            notebooklm_upload.upload_course,
+                            notebook_title, course_dir, last_modified, notebooklm_state_path,
+                            max_age_days=notebooklm_max_age_days,
+                            max_sources=notebooklm_max_sources,
+                            verbose=args.verbose,
+                            report_enabled=notebooklm_report_enabled,
+                            report_language=notebooklm_report_language,
+                        )
+                        notebooklm_futures.append(upload_future)
+                        notebooklm_futures_by_course_dir[course_dir] = upload_future
+                    else:
+                        print("  Note: course is older than the NotebookLM window; skipping upload")
 
-    print("Exporting data from all courses combined as one file: "
-          "all_output.json")
-    json_str = jsonpickle.encode(all_courses_views, unpicklable=False, indent=4)
+        if args.html:
+            extraction_stats.html_pages_generated += export_course_list_html(all_courses_views, DL_LOCATION)
 
-    all_output_path = os.path.join(DL_LOCATION, "all_output.json")
+        print("Exporting data from all courses combined as one file: "
+              "all_output.json")
+        json_str = jsonpickle.encode(all_courses_views, unpicklable=False, indent=4)
 
-    with open(all_output_path, "w") as out_file:
-        out_file.write(json_str)
+        all_output_path = os.path.join(DL_LOCATION, "all_output.json")
 
-    extraction_stats.json_files_created += 1
-    print(f"Combined JSON data exported to: {all_output_path}")
+        with open(all_output_path, "w") as out_file:
+            out_file.write(json_str)
+
+        extraction_stats.json_files_created += 1
+        print(f"Combined JSON data exported to: {all_output_path}")
+
+        if notebooklm_executor:
+            print("Waiting for NotebookLM uploads and study guides to finish…")
+            _record_notebooklm_uploads(
+                [future.result() for future in notebooklm_futures], extraction_stats)
+            notebooklm_executor.shutdown()
+
+    except BaseException:
+        if notebooklm_executor:
+            notebooklm_executor.shutdown(wait=False, cancel_futures=True)
+        raise
 
     print("\nProcess complete. All canvas data exported!")
     print(extraction_stats.summary(DL_LOCATION, html_enabled=args.html))
+
+
+if __name__ == "__main__":
+    main()
