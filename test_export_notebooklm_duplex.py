@@ -1,6 +1,8 @@
 import contextlib
+from datetime import datetime, timedelta, timezone
 import importlib.util
 import io
+import os
 import pathlib
 import sys
 import tempfile
@@ -23,7 +25,8 @@ def _module_stubs():
     canvasapi.exceptions = exceptions
 
     dateutil = types.ModuleType("dateutil")
-    dateutil.parser = types.SimpleNamespace(parse=lambda value: value)
+    dateutil.parser = types.SimpleNamespace(
+        parse=lambda value: datetime.fromisoformat(value.replace("Z", "+00:00")))
     html_export = types.ModuleType("html_export")
     html_export.export_combined_announcements = lambda *args: None
     html_export.export_course_html = lambda *args: 0
@@ -233,6 +236,78 @@ class NotebookLMDuplexWorkflowTest(unittest.TestCase):
         self.assertFalse(runner.is_alive(), "export did not finish after upload release")
         self.assertEqual([], runner_errors)
         self.assertTrue(second_downloaded.is_set())
+
+
+class CourseEndSelectionWorkflowTest(unittest.TestCase):
+    def test_end_at_filter_skips_before_details_and_can_be_overridden(self):
+        exporter = _load_export()
+        now = datetime.now(timezone.utc)
+
+        class Course:
+            def __init__(self, course_id, end_at):
+                self.id = course_id
+                self.name = "Course %s" % course_id
+                self.term = object()
+                self.end_at = end_at
+
+        courses = [
+            Course(1, (now - timedelta(days=31)).isoformat()),
+            Course(2, (now - timedelta(days=29)).isoformat()),
+            Course(3, None),
+            Course(4, None),
+            Course(5, "not-a-timestamp"),
+        ]
+
+        class Canvas:
+            def __init__(self, *args):
+                pass
+
+            def get_current_user(self):
+                return types.SimpleNamespace(name="Student", id=1)
+
+            def get_courses(self, enrollment_state, include):
+                return courses if enrollment_state == "active" else []
+
+        def run_export(extra_args=(), include_ended_env=""):
+            details_requested = []
+            output = io.StringIO()
+
+            def course_view(course):
+                details_requested.append(course.id)
+                return types.SimpleNamespace(
+                    term="Fall", course_code="C%s" % course.id, name=course.name,
+                    assignments=[], modules=[], pages=[], announcements=[], discussions=[])
+
+            with tempfile.TemporaryDirectory() as output_dir, \
+                 mock.patch.object(exporter, "Canvas", Canvas), \
+                 mock.patch.object(exporter, "_load_credentials", return_value={
+                     "API_URL": "https://canvas.example", "API_KEY": "key", "USER_ID": 1,
+                     "COURSES_TO_SKIP": [4]}), \
+                 mock.patch.object(exporter, "_install_default_http_timeout"), \
+                 mock.patch.object(exporter, "getCourseView", side_effect=course_view), \
+                 mock.patch.object(exporter, "downloadCourseFiles"), \
+                 mock.patch.object(exporter, "download_submission_attachments"), \
+                 mock.patch.object(exporter, "findCourseModules", return_value=[]), \
+                 mock.patch.object(exporter, "exportAllCourseData"), \
+                 mock.patch.object(exporter, "export_combined_announcements", return_value=None), \
+                 mock.patch.object(exporter.jsonpickle, "encode", return_value="{}"), \
+                 mock.patch.dict(os.environ, {"CANVAS_INCLUDE_ENDED": include_ended_env}, clear=False), \
+                 mock.patch.object(sys, "argv", ["export.py", "--no-markdown", "--no-ocr", "-o", output_dir, *extra_args]):
+                exporter.extraction_stats = exporter.ExtractionStats()
+                with contextlib.redirect_stdout(output):
+                    exporter.main()
+            return details_requested, output.getvalue()
+
+        details, output = run_export()
+        self.assertEqual([2, 3, 5], details)
+        self.assertIn("Skipping Course 1: ended more than 30 days ago", output)
+        self.assertIn("unreadable end_at; including it", output)
+
+        details, _ = run_export(("--include-ended",))
+        self.assertEqual([1, 2, 3, 5], details)
+
+        details, _ = run_export(include_ended_env="1")
+        self.assertEqual([1, 2, 3, 5], details)
 
 
 if __name__ == "__main__":

@@ -6,6 +6,7 @@ import os
 import argparse
 import sys
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta, timezone
 
 # external
 from canvasapi import Canvas
@@ -1114,6 +1115,23 @@ def _env_flag(name):
     return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _course_ended_before(course, cutoff):
+    """Return whether a course ended before a UTC cutoff from its list response."""
+    end_at = getattr(course, "end_at", None)
+    if not end_at:
+        return False
+    try:
+        ended_at = dateutil.parser.parse(end_at)
+        if ended_at.tzinfo is None:
+            ended_at = ended_at.replace(tzinfo=timezone.utc)
+        else:
+            ended_at = ended_at.astimezone(timezone.utc)
+    except (ValueError, TypeError, OverflowError):
+        print(f"  Note: course {getattr(course, 'id', '?')} has an unreadable end_at; including it")
+        return False
+    return ended_at < cutoff
+
+
 def _fetch_front_page_body(course):
     """Return the course front page HTML, or an empty string when unavailable."""
     try:
@@ -1158,6 +1176,7 @@ def main():
     parser.add_argument("--no-ocr", action="store_true", help="Do not OCR images/PDFs even when MISTRAL_API_KEY is configured.")
     parser.add_argument("--notebooklm", action="store_true", help="Upload recent courses to NotebookLM (requires NOTEBOOKLM_AUTH_JSON).")
     parser.add_argument("--no-notebooklm", action="store_true", help="Do not upload courses to NotebookLM, even when NOTEBOOKLM_AUTH_JSON is set.")
+    parser.add_argument("--include-ended", action="store_true", default=_env_flag("CANVAS_INCLUDE_ENDED"), help="Export courses ended more than 30 days ago (also enabled with CANVAS_INCLUDE_ENDED=1).")
     parser.add_argument("-v", "--verbose", action="store_true", help="Enable verbose output for debugging.")
     parser.add_argument("--version", action="version", version="Canvas Student Data Export Tool 2.0")
 
@@ -1297,6 +1316,7 @@ def main():
                                                   thread_name_prefix="notebooklm")
 
     skip = set(COURSES_TO_SKIP)
+    course_end_cutoff = datetime.now(timezone.utc) - timedelta(days=30)
 
     if args.html:
         print("HTML export enabled: pages will be generated from Canvas API data\n")
@@ -1305,6 +1325,9 @@ def main():
         for courses in courses_list:
             for course in courses:
                 if course.id in skip or not hasattr(course, "name") or not hasattr(course, "term"):
+                    continue
+                if not args.include_ended and _course_ended_before(course, course_end_cutoff):
+                    print(f"  Skipping {course.name}: ended more than 30 days ago (use --include-ended to export it)")
                     continue
 
                 course_view = getCourseView(course)
