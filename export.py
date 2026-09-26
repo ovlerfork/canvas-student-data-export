@@ -203,6 +203,7 @@ def _apply_env_overrides(creds: dict) -> dict:
 API_URL = ""
 API_KEY = ""
 USER_ID = 0
+VERBOSE = False
 
 # Directory in which to download course information to (will be created if not
 # present)
@@ -454,7 +455,7 @@ def findCourseModules(course, course_view):
                 error_type, message = CanvasErrorHandler.handle_canvas_exception(
                     e, "module item processing"
                 )
-                CanvasErrorHandler.log_error(error_type, message, verbose=args.verbose)
+                CanvasErrorHandler.log_error(error_type, message, verbose=VERBOSE)
                 extraction_stats.error_count += 1
 
             module_views.append(module_view)
@@ -464,7 +465,7 @@ def findCourseModules(course, course_view):
         error_type, message = CanvasErrorHandler.handle_canvas_exception(
             e, "module processing"
         )
-        CanvasErrorHandler.log_error(error_type, message, verbose=args.verbose)
+        CanvasErrorHandler.log_error(error_type, message, verbose=VERBOSE)
         extraction_stats.error_count += 1
 
     return module_views
@@ -495,7 +496,7 @@ def downloadCourseFiles(course, course_view):
                     error_type, message = CanvasErrorHandler.handle_canvas_exception(
                         e, f"folder lookup for {file.display_name}"
                     )
-                    CanvasErrorHandler.log_error(error_type, message, verbose=args.verbose)
+                    CanvasErrorHandler.log_error(error_type, message, verbose=VERBOSE)
                     extraction_stats.error_count += 1
                     continue
                 folder_cache[file.folder_id] = file_folder
@@ -516,7 +517,7 @@ def downloadCourseFiles(course, course_view):
                     print(f"      ✓ Saved: {file.display_name}")
                 except Exception as e:
                     error_type, message = CanvasErrorHandler.handle_canvas_exception(e, f"file download for {file.display_name}")
-                    CanvasErrorHandler.log_error(error_type, message, verbose=args.verbose)
+                    CanvasErrorHandler.log_error(error_type, message, verbose=VERBOSE)
                     extraction_stats.error_count += 1
             else:
                 print(f"      ✓ Already exists: {file.display_name}")
@@ -529,7 +530,7 @@ def downloadCourseFiles(course, course_view):
             extraction_stats.student_limitation_warnings += 1
         else:
             extraction_stats.error_count += 1
-        CanvasErrorHandler.log_error(error_type, message, verbose=args.verbose)
+        CanvasErrorHandler.log_error(error_type, message, verbose=VERBOSE)
 
 
 def download_submission_attachments(course, course_view):
@@ -628,7 +629,7 @@ def findCoursePages(course):
                 error_type, message = CanvasErrorHandler.handle_canvas_exception(
                     e, "page download"
                 )
-                CanvasErrorHandler.log_error(error_type, message, verbose=args.verbose)
+                CanvasErrorHandler.log_error(error_type, message, verbose=VERBOSE)
                 extraction_stats.error_count += 1
     except Exception as e:
         # Keep the pages found so far when the listing itself fails.
@@ -637,7 +638,7 @@ def findCoursePages(course):
             error_type, message = CanvasErrorHandler.handle_canvas_exception(
                 e, "page URL retrieval"
             )
-            CanvasErrorHandler.log_error(error_type, message, verbose=args.verbose)
+            CanvasErrorHandler.log_error(error_type, message, verbose=VERBOSE)
             if error_type != "student_limitation":
                 extraction_stats.error_count += 1
             else:
@@ -729,7 +730,7 @@ def findCourseAssignments(course):
                     if extraction_stats.student_limitation_warnings == 1:
                         print(f"    Note: Not authorized to download every student's assignment submission. Downloading submission for user {USER_ID} only.")
                 else:
-                    CanvasErrorHandler.log_error(error_type, message, verbose=args.verbose)
+                    CanvasErrorHandler.log_error(error_type, message, verbose=VERBOSE)
                     extraction_stats.error_count += 1
             except Exception as e:
                 # A missing or failing class listing must not stop the export;
@@ -737,7 +738,7 @@ def findCourseAssignments(course):
                 error_type, message = CanvasErrorHandler.handle_canvas_exception(
                     e, "submission retrieval"
                 )
-                CanvasErrorHandler.log_error(error_type, message, verbose=args.verbose)
+                CanvasErrorHandler.log_error(error_type, message, verbose=VERBOSE)
                 extraction_stats.error_count += 1
 
             if submissions is None:
@@ -754,14 +755,14 @@ def findCourseAssignments(course):
                         error_type, message = CanvasErrorHandler.handle_canvas_exception(
                             e, "submission retrieval"
                         )
-                        CanvasErrorHandler.log_error(error_type, message, verbose=args.verbose)
+                        CanvasErrorHandler.log_error(error_type, message, verbose=VERBOSE)
                         extraction_stats.error_count += 1
                         submissions = []
                     except Exception as e:
                         error_type, message = CanvasErrorHandler.handle_canvas_exception(
                             e, "submission retrieval"
                         )
-                        CanvasErrorHandler.log_error(error_type, message, verbose=args.verbose)
+                        CanvasErrorHandler.log_error(error_type, message, verbose=VERBOSE)
                         extraction_stats.error_count += 1
                         submissions = []
 
@@ -771,13 +772,13 @@ def findCourseAssignments(course):
                 error_type, message = CanvasErrorHandler.handle_canvas_exception(
                     e, "submission retrieval"
                 )
-                CanvasErrorHandler.log_error(error_type, message, verbose=args.verbose)
+                CanvasErrorHandler.log_error(error_type, message, verbose=VERBOSE)
                 extraction_stats.error_count += 1
             except Exception as e:
                 error_type, message = CanvasErrorHandler.handle_canvas_exception(
                     e, "submission retrieval"
                 )
-                CanvasErrorHandler.log_error(error_type, message, verbose=args.verbose)
+                CanvasErrorHandler.log_error(error_type, message, verbose=VERBOSE)
                 extraction_stats.error_count += 1
             else:
                 try:
@@ -845,7 +846,7 @@ def findCourseAssignments(course):
                     error_type, message = CanvasErrorHandler.handle_canvas_exception(
                         e, "submission processing"
                     )
-                    CanvasErrorHandler.log_error(error_type, message, verbose=args.verbose)
+                    CanvasErrorHandler.log_error(error_type, message, verbose=VERBOSE)
                     extraction_stats.error_count += 1
 
             assignment_views.append(assignment_view)
@@ -854,7 +855,7 @@ def findCourseAssignments(course):
         error_type, message = CanvasErrorHandler.handle_canvas_exception(
             e, "course assignments processing"
         )
-        CanvasErrorHandler.log_error(error_type, message, verbose=args.verbose)
+        CanvasErrorHandler.log_error(error_type, message, verbose=VERBOSE)
         extraction_stats.error_count += 1
 
     return assignment_views
@@ -875,7 +876,7 @@ def findCourseAnnouncements(course):
         error_type, message = CanvasErrorHandler.handle_canvas_exception(
             e, "announcement processing"
         )
-        CanvasErrorHandler.log_error(error_type, message, verbose=args.verbose)
+        CanvasErrorHandler.log_error(error_type, message, verbose=VERBOSE)
         extraction_stats.error_count += 1
 
     return announcement_views
@@ -960,7 +961,7 @@ def getDiscussionView(discussion_topic):
                     error_type, message = CanvasErrorHandler.handle_canvas_exception(
                         e, "discussion topic reply processing"
                     )
-                    CanvasErrorHandler.log_error(error_type, message, verbose=args.verbose)
+                    CanvasErrorHandler.log_error(error_type, message, verbose=VERBOSE)
                     if error_type == "student_limitation":
                         extraction_stats.student_limitation_warnings += 1
                     elif error_type == "not_found":
@@ -973,7 +974,7 @@ def getDiscussionView(discussion_topic):
             error_type, message = CanvasErrorHandler.handle_canvas_exception(
                 e, "discussion topic entry processing"
             )
-            CanvasErrorHandler.log_error(error_type, message, verbose=args.verbose)
+            CanvasErrorHandler.log_error(error_type, message, verbose=VERBOSE)
             if error_type == "student_limitation":
                 extraction_stats.student_limitation_warnings += 1
             elif error_type == "not_found":
@@ -1003,7 +1004,7 @@ def findCourseDiscussions(course):
         error_type, message = CanvasErrorHandler.handle_canvas_exception(
             e, "discussion processing"
         )
-        CanvasErrorHandler.log_error(error_type, message, verbose=args.verbose)
+        CanvasErrorHandler.log_error(error_type, message, verbose=VERBOSE)
         extraction_stats.error_count += 1
 
     return discussion_views
@@ -1163,7 +1164,7 @@ def _preserve_mtime(path, canvas_object):
 
 
 def main():
-    global API_URL, API_KEY, USER_ID, COURSES_TO_SKIP, DL_LOCATION, DOWNLOAD_TIMEOUT
+    global API_URL, API_KEY, USER_ID, COURSES_TO_SKIP, DL_LOCATION, DOWNLOAD_TIMEOUT, VERBOSE
 
 
     print("Welcome to the Canvas Student Data Export Tool\n")
@@ -1181,6 +1182,7 @@ def main():
     parser.add_argument("--version", action="version", version="Canvas Student Data Export Tool 2.0")
 
     args = parser.parse_args()
+    VERBOSE = args.verbose
 
     # Load credentials from YAML (if present) and let CANVAS_* env vars override.
     creds = _apply_env_overrides(_load_credentials(args.config))

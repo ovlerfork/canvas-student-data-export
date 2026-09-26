@@ -310,5 +310,110 @@ class CourseEndSelectionWorkflowTest(unittest.TestCase):
         self.assertEqual([1, 2, 3, 5], details)
 
 
+class ErrorVerbosityRegressionTest(unittest.TestCase):
+    def _run_export(self, exporter, courses, extra_args=()):
+        output = io.StringIO()
+        errors = io.StringIO()
+
+        class Canvas:
+            def __init__(self, *args):
+                pass
+
+            def get_current_user(self):
+                return types.SimpleNamespace(name="Student", id=1)
+
+            def get_courses(self, enrollment_state, include):
+                return courses if enrollment_state == "active" else []
+
+        def course_view(course):
+            return types.SimpleNamespace(
+                term="Fall", course_code="C%s" % course.id, name=course.name,
+                assignments=[], modules=[], pages=[], announcements=[], discussions=[])
+
+        with tempfile.TemporaryDirectory() as output_dir, \
+             mock.patch.object(exporter, "Canvas", Canvas), \
+             mock.patch.object(exporter, "_load_credentials", return_value={
+                 "API_URL": "https://canvas.example", "API_KEY": "key", "USER_ID": 1}), \
+             mock.patch.object(exporter, "_install_default_http_timeout"), \
+             mock.patch.object(exporter, "getCourseView", side_effect=course_view), \
+             mock.patch.object(exporter, "download_submission_attachments"), \
+             mock.patch.object(exporter, "findCourseModules", return_value=[]), \
+             mock.patch.object(exporter, "export_combined_announcements", return_value=None), \
+             mock.patch.object(exporter.jsonpickle, "encode", return_value="{}"), \
+             mock.patch.object(sys, "argv", ["export.py", "--no-notebooklm", "--no-markdown",
+                                              "--no-ocr", "-o", output_dir, *extra_args]):
+            exporter.extraction_stats = exporter.ExtractionStats()
+            with contextlib.redirect_stdout(output), contextlib.redirect_stderr(errors):
+                exporter.main()
+            result = {
+                "stdout": output.getvalue(),
+                "stderr": errors.getvalue(),
+                "course_outputs": [
+                    pathlib.Path(output_dir) / "Fall" / ("C%s" % course.id)
+                    / ("C%s.json" % course.id)
+                    for course in courses
+                ],
+                "combined": pathlib.Path(output_dir) / "all_output.json",
+            }
+            result["course_outputs_exist"] = [
+                course_output.is_file() for course_output in result["course_outputs"]
+            ]
+            result["combined_exists"] = result["combined"].is_file()
+        return result
+
+    def test_forbidden_file_listing_continues_each_course_without_name_error(self):
+        exporter = _load_export()
+
+        class Course:
+            def __init__(self, course_id):
+                self.id = course_id
+                self.name = "Course %s" % course_id
+                self.term = object()
+
+            def get_files(self):
+                return iter(()) if self.id == 2 else self._forbidden_files()
+
+            def _forbidden_files(self):
+                class Files:
+                    def __iter__(self):
+                        raise exporter.Forbidden("file listing is forbidden")
+                return Files()
+
+        result = self._run_export(exporter, [Course(1), Course(2)])
+
+        self.assertIn("Note: Access forbidden for course file download.", result["stdout"])
+        self.assertIn("Student Account Limitations: 1 (expected)", result["stdout"])
+        self.assertIn("Errors Encountered: 0", result["stdout"])
+        self.assertEqual([True, True], result["course_outputs_exist"])
+        self.assertTrue(result["combined_exists"])
+
+    def test_verbose_flag_controls_traceback_for_file_listing_errors(self):
+        for verbose in (False, True):
+            with self.subTest(verbose=verbose):
+                exporter = _load_export()
+
+                class Course:
+                    id = 1
+                    name = "Course 1"
+                    term = object()
+
+                    def get_files(self):
+                        class Files:
+                            def __iter__(self):
+                                raise ValueError("file listing failed")
+                        return Files()
+
+                result = self._run_export(exporter, [Course()], ("--verbose",) if verbose else ())
+
+                self.assertIn("ERROR: Unexpected error during course file download: file listing failed",
+                              result["stdout"])
+                self.assertIn("Errors Encountered: 1", result["stdout"])
+                if verbose:
+                    self.assertIn("Traceback", result["stderr"])
+                    self.assertIn("ValueError: file listing failed", result["stderr"])
+                else:
+                    self.assertEqual("", result["stderr"])
+
+
 if __name__ == "__main__":
     unittest.main()
