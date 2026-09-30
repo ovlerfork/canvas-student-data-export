@@ -6,10 +6,13 @@ module uploads the files that should become NotebookLM sources, keeping a
 persistent JSON state file so an interrupted run can be resumed without
 re-uploading the same bytes.
 
-Auth is read ONLY from the ``NOTEBOOKLM_AUTH_JSON`` environment variable
-(inline Playwright storage-state JSON); we never install or drive Playwright
-and never call ``login``. The optional ``NOTEBOOKLM_PROFILE`` environment
-variable is forwarded to :meth:`NotebookLMClient.from_storage` as ``profile=``.
+Auth is seeded from the ``NOTEBOOKLM_AUTH_JSON`` environment variable (inline
+Playwright storage-state JSON) into the export output directory; we never
+install or drive Playwright and never call ``login``. A matching seed keeps
+using that local state so refreshed cookies survive a process restart. The
+optional ``NOTEBOOKLM_PROFILE`` environment variable is forwarded to
+:meth:`NotebookLMClient.from_storage` as ``profile=`` when no inline seed is
+configured.
 
 The ``notebooklm`` package is imported lazily, so this module (and the rest of
 the exporter) imports and runs fine when it is not installed. Error handling is
@@ -24,6 +27,7 @@ import importlib.util
 import json
 import os
 import re
+import tempfile
 import time
 
 from naming import makeValidFilename
@@ -41,6 +45,8 @@ SUPPORTED_EXTENSIONS = {
 DEFAULT_MAX_SOURCES = 300
 DEFAULT_MAX_AGE_DAYS = 90
 STATE_FILE_NAME = ".notebooklm_state.json"
+AUTH_STATE_FILE_NAME = ".notebooklm_auth_state.json"
+AUTH_SEED_FILE_NAME = ".notebooklm_auth_seed.sha256"
 
 # Study guides are generated in Simplified Chinese unless configured otherwise.
 DEFAULT_REPORT_LANGUAGE = "zh_Hans"
@@ -507,6 +513,50 @@ def _notebooklm_profile():
     return value.strip() or None
 
 
+def _write_private_file(path, content):
+    """Atomically replace a credential-related file with owner-only permissions."""
+    directory = os.path.dirname(os.path.abspath(path))
+    os.makedirs(directory, mode=0o700, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(prefix=".notebooklm-", dir=directory)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(content)
+        os.replace(tmp_path, path)
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
+def _persistent_auth_storage(state_path):
+    """Seed a local SDK storage file when the configured auth JSON changes.
+
+    NotebookLM updates cookies in the storage file itself.  The fingerprint is
+    deliberately stored separately: SDK storage saves may replace the JSON
+    and are not required to preserve application metadata.
+    """
+    auth_json = os.environ.get("NOTEBOOKLM_AUTH_JSON", "")
+    if not auth_json.strip():
+        return None
+
+    directory = os.path.dirname(os.path.abspath(state_path))
+    auth_path = os.path.join(directory, AUTH_STATE_FILE_NAME)
+    seed_path = os.path.join(directory, AUTH_SEED_FILE_NAME)
+    fingerprint = hashlib.sha256(auth_json.encode("utf-8")).hexdigest()
+    try:
+        with open(seed_path, "r", encoding="utf-8") as handle:
+            current_fingerprint = handle.read().strip()
+    except FileNotFoundError:
+        current_fingerprint = ""
+
+    if current_fingerprint != fingerprint or not os.path.isfile(auth_path):
+        _write_private_file(auth_path, auth_json)
+        _write_private_file(seed_path, fingerprint + "\n")
+    return auth_path
+
+
 def _new_state():
     return {"version": 2, "notebooks": {}, "notebook_ids": {}}
 
@@ -680,7 +730,10 @@ async def _upload_course_async(title, course_dir, state_path, max_sources, verbo
                                report_enabled=True, report_language=None):
     NotebookLMClient = _load_client()
     profile = _notebooklm_profile()
-    if profile:
+    auth_path = _persistent_auth_storage(state_path)
+    if auth_path:
+        client_context = NotebookLMClient.from_storage(path=auth_path)
+    elif profile:
         client_context = NotebookLMClient.from_storage(profile=profile)
     else:
         client_context = NotebookLMClient.from_storage()
