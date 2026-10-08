@@ -21,6 +21,7 @@ of after one huge request.
 
 import base64
 import os
+import re
 import time
 
 import requests
@@ -273,8 +274,10 @@ def _append_page(page, page_parts, path, stem, attachment_dir):
         rel = "attachments/" + stem + "/" + img_id
         page_md = page_md.replace("(" + str(raw_id) + ")", "(" + rel + ")")
 
-    if page_md.strip():
-        page_parts.append("<!-- page %d -->\n\n%s" % (len(page_parts) + 1, page_md.strip()))
+    is_pdf = os.path.splitext(path)[1].lower() == ".pdf"
+    if page_md.strip() or is_pdf:
+        page_number = page["index"] + 1 if is_pdf else len(page_parts) + 1
+        page_parts.append("<!-- page %d -->\n\n%s" % (page_number, page_md.strip()))
     return attachment_dir
 
 
@@ -322,6 +325,24 @@ def _sync_mtime(source_path, output_path):
         pass
 
 
+def _existing_pdf_incomplete(md_path, total_pages):
+    """Only repair recognized OCR output whose page markers are incomplete."""
+    with open(md_path, encoding="utf-8") as source:
+        markers = re.findall(r"^<!-- page (\d+) -->$", source.read(), re.MULTILINE)
+    if not markers:
+        return False
+    return total_pages is None or [int(marker) for marker in markers] != list(
+        range(1, total_pages + 1))
+
+
+def _verify_pdf_pages(pages, start, stop):
+    """Require the exact requested zero-based page sequence, including blanks."""
+    indexes = [page.get("index") for page in pages]
+    if any(type(index) is not int for index in indexes) or indexes != list(range(start, stop)):
+        raise ValueError("Incomplete PDF OCR: expected pages %d-%d, received %r"
+                         % (start + 1, stop, indexes))
+
+
 def ocr_file(path, api_key, model=DEFAULT_OCR_MODEL,
              timeout=DEFAULT_OCR_TIMEOUT, force=False, verbose=False,
              min_interval=None, pages_per_request=None):
@@ -350,10 +371,17 @@ def ocr_file(path, api_key, model=DEFAULT_OCR_MODEL,
         stem = _stem_for(path)
         md_path = _md_path_for(path)
 
-        if os.path.exists(md_path) and not force:
+        total_pages = _pdf_page_count(path) if ext == ".pdf" else None
+        if os.path.exists(md_path) and not force and not (
+                ext == ".pdf" and _existing_pdf_incomplete(md_path, total_pages)):
             if verbose:
                 print("      ✓ Already exists: %s" % md_path)
             return None
+
+        if ext == ".pdf" and total_pages is None:
+            raise ValueError("Cannot verify PDF completeness: source page count unavailable")
+        if total_pages is not None and total_pages > MAX_OCR_PAGES:
+            raise ValueError("PDF exceeds the %d-page OCR limit" % MAX_OCR_PAGES)
 
         interval = _resolve_interval(min_interval)
         chunk_pages = _resolve_pages_per_request(pages_per_request)
@@ -373,8 +401,8 @@ def ocr_file(path, api_key, model=DEFAULT_OCR_MODEL,
                 print("    Note: %s is larger than Mistral's ~50 MB inline limit; skipping." % path)
                 return None
 
-        total_pages = _pdf_page_count(path) if chunked else None
         page_parts = []
+        buffered_pages = []
         attachment_dir = None
         start = 0
         tried_inline = False
@@ -385,21 +413,17 @@ def ocr_file(path, api_key, model=DEFAULT_OCR_MODEL,
                 "include_image_base64": True,
             }
             if chunked:
-                if total_pages is not None and start >= total_pages:
+                if start >= total_pages:
                     break
                 if chunk_pages == 1:
                     payload["pages"] = str(start)
                 else:
-                    payload["pages"] = "%d-%d" % (start, start + chunk_pages - 1)
+                    payload["pages"] = "%d-%d" % (start, min(start + chunk_pages, total_pages) - 1)
 
             try:
                 response = _post_ocr(payload, headers, timeout, interval, verbose)
             except requests.HTTPError as exc:
                 status = getattr(getattr(exc, "response", None), "status_code", None)
-                if chunked and start > 0 and status in (400, 404, 416, 422):
-                    # Asked for pages past the end of the document: keep what
-                    # has been extracted so far.
-                    break
                 if chunked and not tried_inline and status == 422:
                     # The Files API route rejected this document; retry once
                     # inline as a single request.
@@ -407,6 +431,9 @@ def ocr_file(path, api_key, model=DEFAULT_OCR_MODEL,
                     if inline is not None:
                         tried_inline = True
                         chunked = False
+                        start = 0
+                        page_parts = []
+                        buffered_pages = []
                         document = inline
                         if verbose:
                             print("      File-based OCR rejected; retrying inline: %s" % path)
@@ -416,22 +443,19 @@ def ocr_file(path, api_key, model=DEFAULT_OCR_MODEL,
             pages = data.get("pages") or []
             _note_pages(len(pages), interval)
 
-            for page in pages:
-                attachment_dir = _append_page(page, page_parts, path, stem, attachment_dir)
+            if ext == ".pdf":
+                stop = min(start + chunk_pages, total_pages) if chunked else total_pages
+                _verify_pdf_pages(pages, start, stop)
 
-            if not chunked or not pages:
+            buffered_pages.extend(pages)
+
+            if not chunked:
                 break
-            indexes = []
-            for offset, page in enumerate(pages):
-                try:
-                    indexes.append(int(page.get("index", start + offset)))
-                except (TypeError, ValueError):
-                    indexes.append(start + offset)
-            if len(pages) < chunk_pages or max(indexes) < start:
-                break
-            start = max(indexes) + 1
-            if start >= MAX_OCR_PAGES:
-                break
+            start = stop
+
+        # Validate the whole document before replacing any linked images.
+        for page in buffered_pages:
+            attachment_dir = _append_page(page, page_parts, path, stem, attachment_dir)
 
         full_md = "\n\n---\n\n".join(page_parts)
         if not full_md.strip():
@@ -471,7 +495,7 @@ def ocr_file(path, api_key, model=DEFAULT_OCR_MODEL,
 def ocr_tree(root, api_key, model=DEFAULT_OCR_MODEL,
              timeout=DEFAULT_OCR_TIMEOUT, force=False, verbose=False,
              min_interval=None, pages_per_request=None):
-    """Walk root and OCR every OCR_EXTENSIONS file without a sibling ``.md``.
+    """Walk root and OCR missing outputs and incomplete PDF OCR siblings.
 
     Returns the list of md paths written. Never raises.
     """
@@ -489,8 +513,6 @@ def ocr_tree(root, api_key, model=DEFAULT_OCR_MODEL,
             if ext not in OCR_EXTENSIONS:
                 continue
             path = os.path.join(dirpath, filename)
-            if os.path.exists(_md_path_for(path)) and not force:
-                continue
             result = ocr_file(path, api_key, model=model, timeout=timeout,
                               force=force, verbose=verbose,
                               min_interval=min_interval,
