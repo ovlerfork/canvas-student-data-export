@@ -23,7 +23,8 @@ class PdfCompletenessTest(unittest.TestCase):
         with self.pdf.open("wb") as destination:
             writer.write(destination)
         self.md = self.pdf.with_suffix(".md")
-        self.output = contextlib.redirect_stdout(io.StringIO())
+        self.log = io.StringIO()
+        self.output = contextlib.redirect_stdout(self.log)
         self.output.__enter__()
         self.addCleanup(self.output.__exit__, None, None, None)
 
@@ -56,6 +57,9 @@ class PdfCompletenessTest(unittest.TestCase):
         self.assertIn("<!-- page 3 -->\n\nText 2", self.md.read_text())
         self.assertEqual([call.kwargs["json"]["pages"] for call in post.call_args_list],
                          ["0-1", "2-2"])
+        self.assertIn("Inspecting PDF page count: %s" % self.pdf, self.log.getvalue())
+        self.assertIn("PDF page count: %s: 3" % self.pdf, self.log.getvalue())
+        self.assertIn("OCR saved: %s (3/3 PDF pages)" % self.md, self.log.getvalue())
 
     def test_incomplete_or_wrong_chunks_preserve_existing_markdown(self):
         old = "<!-- page 1 -->\n\n![Previously extracted image](attachments/source/image.png)"
@@ -105,6 +109,8 @@ class PdfCompletenessTest(unittest.TestCase):
         result, post = self.run_ocr([], tree=True)
         self.assertEqual(result, [])
         post.assert_not_called()
+        self.assertIn("Skipping OCR; Markdown already exists: %s" % self.md,
+                      self.log.getvalue())
         self.md.write_text("Hand-authored notes")
         result, post = self.run_ocr([], tree=True)
         self.assertEqual(result, [])
@@ -117,6 +123,15 @@ class PdfCompletenessTest(unittest.TestCase):
         self.assertIsNone(result)
         post.assert_not_called()
         self.assertFalse(self.md.exists())
+
+    def test_pdf_inspection_failure_reports_source_and_cause(self):
+        with mock.patch("pypdf.PdfReader", side_effect=ValueError("broken xref")):
+            result, post = self.run_ocr([])
+        self.assertIsNone(result)
+        post.assert_not_called()
+        self.assertIn("PDF page count unavailable for %s: ValueError: broken xref"
+                      % self.pdf, self.log.getvalue())
+        self.assertIn("Cannot verify PDF completeness", self.log.getvalue())
 
 
 if __name__ == "__main__":

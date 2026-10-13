@@ -190,14 +190,20 @@ def _inline_document(path):
 
 def _pdf_page_count(path):
     """Number of pages in a PDF, or None when it cannot be determined."""
+    print("      Inspecting PDF page count: %s" % path, flush=True)
     try:
         from pypdf import PdfReader
-    except Exception:
+    except Exception as exc:
+        print("    Note: PDF page count unavailable for %s: %s: %s"
+              % (path, type(exc).__name__, exc))
         return None
     try:
         count = len(PdfReader(path).pages)
-    except Exception:
+    except Exception as exc:
+        print("    Note: PDF page count unavailable for %s: %s: %s"
+              % (path, type(exc).__name__, exc))
         return None
+    print("      PDF page count: %s: %d" % (path, count))
     return count if count > 0 else None
 
 
@@ -372,11 +378,12 @@ def ocr_file(path, api_key, model=DEFAULT_OCR_MODEL,
         md_path = _md_path_for(path)
 
         total_pages = _pdf_page_count(path) if ext == ".pdf" else None
-        if os.path.exists(md_path) and not force and not (
-                ext == ".pdf" and _existing_pdf_incomplete(md_path, total_pages)):
-            if verbose:
-                print("      ✓ Already exists: %s" % md_path)
-            return None
+        if os.path.exists(md_path) and not force:
+            if ext == ".pdf" and _existing_pdf_incomplete(md_path, total_pages):
+                print("      Reprocessing incomplete PDF OCR output: %s" % md_path)
+            else:
+                print("      Skipping OCR; Markdown already exists: %s" % md_path)
+                return None
 
         if ext == ".pdf" and total_pages is None:
             raise ValueError("Cannot verify PDF completeness: source page count unavailable")
@@ -476,7 +483,11 @@ def ocr_file(path, api_key, model=DEFAULT_OCR_MODEL,
                 pass
             raise
 
-        print("      ✓ OCR saved: %s" % md_path)
+        if ext == ".pdf":
+            print("      ✓ OCR saved: %s (%d/%d PDF pages)"
+                  % (md_path, len(buffered_pages), total_pages))
+        else:
+            print("      ✓ OCR saved: %s" % md_path)
         _sync_mtime(path, md_path)
         return md_path
     except Exception as e:
