@@ -193,11 +193,6 @@ def _pdf_page_count(path):
     print("      Inspecting PDF page count: %s" % path, flush=True)
     try:
         from pypdf import PdfReader
-    except Exception as exc:
-        print("    Note: PDF page count unavailable for %s: %s: %s"
-              % (path, type(exc).__name__, exc))
-        return None
-    try:
         count = len(PdfReader(path).pages)
     except Exception as exc:
         print("    Note: PDF page count unavailable for %s: %s: %s"
@@ -382,7 +377,8 @@ def ocr_file(path, api_key, model=DEFAULT_OCR_MODEL,
             if ext == ".pdf" and _existing_pdf_incomplete(md_path, total_pages):
                 print("      Reprocessing incomplete PDF OCR output: %s" % md_path)
             else:
-                print("      Skipping OCR; Markdown already exists: %s" % md_path)
+                if ext == ".pdf" or verbose:
+                    print("      Skipping OCR; Markdown already exists: %s" % md_path)
                 return None
 
         if ext == ".pdf" and total_pages is None:
